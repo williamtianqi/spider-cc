@@ -1,0 +1,13 @@
+{
+  "seed_url": "https://docs.python.org/3/",
+  "allowed_hosts": ["docs.python.org"],
+  "max_pages": 120,
+  "max_discovered": 5000,
+  "max_depth": 4,
+  "max_sitemaps": 50,
+  "max_workers": 4,
+  "batch_size": 30,
+  "timeout": 25,
+  "max_page_bytes": 2000000,
+  "max_sitemap_bytes": 50000000
+}
