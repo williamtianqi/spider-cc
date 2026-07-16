@@ -1,0 +1,57 @@
+{
+  "base_url": "https://docs.python.org/3/",
+  "allowed_hosts": [
+    "docs.python.org"
+  ],
+  "include_path_prefixes": [
+    "/3/"
+  ],
+  "extractor": "trafilatura",
+  "probe": {
+    "robots_url": "https://docs.python.org/robots.txt",
+    "robots_status": 200,
+    "robot_sitemaps": [
+      "https://docs.python.org/sitemap.xml"
+    ],
+    "homepage_status": 200,
+    "homepage_final_url": "https://docs.python.org/3/",
+    "sitemap_seed_count": 1,
+    "sitemap_reports": [
+      {
+        "sitemap_url": "https://docs.python.org/sitemap.xml",
+        "status": 200,
+        "ok": true,
+        "error": ""
+      }
+    ],
+    "raw_sitemap_urls": 8,
+    "raw_homepage_links": 91,
+    "raw_feed_urls": 0,
+    "candidate_urls": 549,
+    "reject_counts": {
+      "path_prefix_filtered": 21,
+      "offsite": 12,
+      "duplicate_url": 43,
+      "low_value": 1
+    },
+    "depth1_reject_counts": {
+      "offsite": 106,
+      "duplicate_url": 8397,
+      "path_prefix_filtered": 22,
+      "low_value": 2
+    }
+  },
+  "candidates": 549,
+  "requested_pages": 80,
+  "unique_downloaded_pages": 80,
+  "manifest_records": 80,
+  "dedupe_counts": {
+    "unique": 80
+  },
+  "elapsed_seconds": 47.87,
+  "files": {
+    "candidates": "data/sample_run/docs_python_org/candidates.csv",
+    "manifest": "data/sample_run/docs_python_org/manifest.jsonl",
+    "extracted_text": "data/sample_run/docs_python_org/extracted_text.jsonl"
+  }
+}

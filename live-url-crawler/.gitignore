@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+venv/
+data/runs/
+data/**/*.html
+cc_*.json
+cc_*.jsonl
+cc_*.tsv
+cc_*.jsonl.*
+nohup.out

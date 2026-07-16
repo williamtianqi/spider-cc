@@ -1,0 +1,13 @@
+{
+  "base_url": "https://docs.python.org/3/",
+  "allowed_hosts": ["docs.python.org"],
+  "include_path_prefixes": ["/3/"],
+  "max_sitemaps": 30,
+  "max_candidates": 1000,
+  "link_discovery_pages": 20,
+  "max_pages": 80,
+  "max_workers": 4,
+  "timeout": 25,
+  "max_page_bytes": 2000000,
+  "max_sitemap_bytes": 50000000
+}
