@@ -3,7 +3,7 @@ name = "live-url-crawler"
 version = "0.1.0"
 description = "Live web crawler seeded from Common Crawl site discovery"
 requires-python = ">=3.10"
-dependencies = ["trafilatura>=1.12.0"]
+dependencies = ["trafilatura>=1.12.0", "lxml_html_clean>=0.1.0"]
 
 [project.optional-dependencies]
 async = ["aiohttp>=3.9"]
