@@ -15,20 +15,19 @@
 """
 import argparse
 import asyncio
-import gzip
 import hashlib
 import html as html_module
 import json
 import re
 import time
-from collections import Counter, deque
+from collections import deque
 from pathlib import Path
-from urllib.parse import quote, urljoin, urldefrag, urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import parse_qsl, quote, urldefrag, urlencode, urljoin, urlparse, urlunparse
 
 try:
     import aiohttp
-except ImportError:
-    raise SystemExit("需要 aiohttp: pip install aiohttp")
+except ImportError as exc:
+    raise SystemExit("需要 aiohttp: pip install aiohttp") from exc
 
 USER_AGENT = "live-url-crawler/2.0 (async)"
 STATIC_EXTENSIONS = {
@@ -305,7 +304,7 @@ class AsyncCrawlEngine:
 
     def load_seeds(self, seeds_tsv, max_sites, pages_per_site, max_discovered, max_depth, output_root):
         count = 0
-        with open(seeds_tsv, "r", encoding="utf-8") as f:
+        with open(seeds_tsv, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#"):

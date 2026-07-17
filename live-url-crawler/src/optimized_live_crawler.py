@@ -4,7 +4,6 @@ import csv
 import gzip
 import hashlib
 import json
-import math
 import re
 import time
 import urllib.robotparser
@@ -14,8 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, quote, urlencode, urldefrag, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urldefrag, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 try:

@@ -213,6 +213,20 @@ python3 src/optimized_live_crawler.py \
   --save-html
 ```
 
+## 开发与测试
+
+安装开发依赖并运行 lint + 单元测试：
+
+```bash
+python3 -m pip install --index-url https://pypi.org/simple -e ".[dev]"
+ruff check .
+pytest -q
+```
+
+测试覆盖核心纯函数逻辑：URL 规范化/去重、scope 判断、sitemap/feed XML 解析、
+正文抽取、charset 解码、WARC header 解析、Common Crawl 站点筛选等（无需联网）。
+CI 会在 push/PR 时对 Python 3.10/3.11/3.12 自动跑 lint 和测试。
+
 ## 当前样例结果
 
 已整理到：

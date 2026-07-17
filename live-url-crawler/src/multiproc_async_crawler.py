@@ -11,7 +11,6 @@ N 个进程 × 单进程 150-200 p/s = N × 175 p/s
 import argparse
 import json
 import multiprocessing
-import os
 import sys
 import time
 from pathlib import Path
@@ -59,7 +58,7 @@ def worker_main(worker_id, seeds_chunk, args_dict):
 
 def load_all_seeds(seeds_tsv, max_sites):
     seeds = []
-    with open(seeds_tsv, "r", encoding="utf-8") as f:
+    with open(seeds_tsv, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):

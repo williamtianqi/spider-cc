@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.error import HTTPError
-from urllib.parse import parse_qsl, quote, urlencode, urldefrag, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urldefrag, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 try:

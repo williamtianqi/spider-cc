@@ -64,7 +64,6 @@ def analyze_run(run_dir):
     ok_manifest = [row for row in manifest if row.get("ok")]
     manifest_text_lengths = [int(row.get("text_length") or 0) for row in ok_manifest]
     manifest_non_empty_text = [value for value in manifest_text_lengths if value > 0]
-    manifest_content_hashes = [row.get("content_hash") for row in ok_manifest if row.get("content_hash")]
     manifest_duplicate_content_count = sum(1 for row in manifest if row.get("content_duplicate"))
     text_lengths = [int(row.get("text_length") or 0) for row in extracted]
     non_empty_text = [value for value in text_lengths if value > 0]
