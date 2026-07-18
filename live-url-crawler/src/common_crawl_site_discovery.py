@@ -264,10 +264,29 @@ def parse_args():
         "accepted domains are appended so later runs (even with a "
         "different --crawl-id) do not rediscover the same sites.",
     )
+    parser.add_argument(
+        "--processed-wets-file",
+        help="Persisted registry of WET paths that were fully consumed by "
+        "previous runs. Listed paths are skipped so re-runs and crash "
+        "restarts never re-download or re-parse the same WET file. A path "
+        "is only registered when every row in it was consumed (a file cut "
+        "short by --max-sites or a download failure stays unregistered and "
+        "is retried next run).",
+    )
     return parser.parse_args()
 
 
 def load_seen_domains(path):
+    if not path:
+        return set()
+    p = Path(path)
+    if not p.exists():
+        return set()
+    with p.open("r", encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def load_processed_wets(path):
     if not path:
         return set()
     p = Path(path)
@@ -282,8 +301,16 @@ def main():
     started = time.time()
     emit_progress(args, {"stage": "discovery_start", "crawl_id": args.crawl_id, "max_wet_files": args.max_wet_files, "max_sites": args.max_sites, "english_domain_only": args.english_domain_only, "spread_wet_paths": args.spread_wet_paths})
     all_wet_paths = read_wet_paths(args)
+    processed_wets = load_processed_wets(args.processed_wets_file)
+    skipped_processed_wets = 0
+    if processed_wets:
+        before = len(all_wet_paths)
+        all_wet_paths = [p for p in all_wet_paths if p not in processed_wets]
+        skipped_processed_wets = before - len(all_wet_paths)
+        emit_progress(args, {"stage": "processed_wets_filtered", "already_processed": skipped_processed_wets, "remaining_wet_paths": len(all_wet_paths)})
     wet_paths = select_wet_paths(all_wet_paths, args.max_wet_files, args.spread_wet_paths)
     emit_progress(args, {"stage": "wet_paths_selected", "wet_paths_available": len(all_wet_paths), "wet_paths_considered": len(wet_paths), "spread_wet_paths": args.spread_wet_paths})
+    processed_f = Path(args.processed_wets_file).open("a", encoding="utf-8") if args.processed_wets_file else None
     seen_domains = load_seen_domains(args.seen_domains_file)
     preloaded_domains = len(seen_domains)
     newly_seen_domains = []
@@ -316,7 +343,8 @@ def main():
                     emit_progress(args, {"stage": "wet_path_done", "wet_path": path, "submitted_wet_paths": next_index, "active_workers": len(futures), "unique_sites": accepted, "file_counters": dict(file_counters)})
                     errors = [row for row in rows if row.get("error")]
                     write_jsonl_row(manifest_f, {"wet_path": path, "counters": dict(file_counters), "errors": errors[:5]})
-                    for row in rows:
+                    consumed_all_rows = True
+                    for row_index, row in enumerate(rows):
                         if row.get("error"):
                             continue
                         domain = row["registrable_domain"]
@@ -333,7 +361,12 @@ def main():
                         counters["unique_sites"] += 1
                         accepted += 1
                         if accepted >= args.max_sites:
+                            consumed_all_rows = row_index == len(rows) - 1
                             break
+                    if processed_f is not None and consumed_all_rows and not file_counters.get("failed_wet_files"):
+                        processed_f.write(path + "\n")
+                        processed_f.flush()
+                        counters["registered_processed_wets"] += 1
                     sites_f.flush()
                     seeds_f.flush()
                     manifest_f.flush()
@@ -341,6 +374,9 @@ def main():
                         path = wet_paths[next_index]
                         futures[pool.submit(discover_sites_from_wet, path, args)] = path
                         next_index += 1
+
+    if processed_f is not None:
+        processed_f.close()
 
     if args.seen_domains_file and newly_seen_domains:
         with Path(args.seen_domains_file).open("a", encoding="utf-8") as f:
@@ -360,6 +396,9 @@ def main():
         "seen_domains_file": args.seen_domains_file or "",
         "preloaded_domains_from_registry": preloaded_domains,
         "total_domains_in_registry_after_run": len(seen_domains),
+        "processed_wets_file": args.processed_wets_file or "",
+        "wet_paths_skipped_already_processed": skipped_processed_wets,
+        "wet_paths_registered_processed_this_run": counters.get("registered_processed_wets", 0),
         "unique_sites_per_ok_wet_file": round(unique_sites / ok_wet_files, 2) if ok_wet_files else 0,
         "candidate_sites_per_ok_wet_file": round(counters.get("candidate_sites", 0) / ok_wet_files, 2) if ok_wet_files else 0,
         "accepted_tld_counts_top50": tld_counts.most_common(50),

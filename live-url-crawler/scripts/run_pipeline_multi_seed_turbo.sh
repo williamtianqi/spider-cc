@@ -16,6 +16,12 @@ MAX_HOST_WORKERS="${MAX_HOST_WORKERS:-32}"
 MAX_IN_FLIGHT_FETCH="${MAX_IN_FLIGHT_FETCH:-2048}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-6}"
 FORCE_RECRAWL="${FORCE_RECRAWL:-0}"
+# Optional: directory of per-site URL lists exported by cc_index_url_seeder.py
+# ($SEED_URLS_DIR/<output_name>.jsonl is passed as --seed-urls-file when present).
+SEED_URLS_DIR="${SEED_URLS_DIR:-}"
+# Optional: directory for per-site ETag/Last-Modified caches; enables conditional
+# revisit requests (HTTP 304) across daily re-crawls of the same sites.
+HTTP_CACHE_DIR="${HTTP_CACHE_DIR:-}"
 
 mkdir -p "$OUTPUT_ROOT"
 
@@ -36,6 +42,15 @@ run_one_seed() {
   local output_name="$3"
   local output_dir="$OUTPUT_ROOT/$output_name"
   local resume_flag=""
+  local extra_args=()
+
+  if [[ -n "$SEED_URLS_DIR" && -f "$SEED_URLS_DIR/$output_name.jsonl" ]]; then
+    extra_args+=(--seed-urls-file "$SEED_URLS_DIR/$output_name.jsonl")
+  fi
+  if [[ -n "$HTTP_CACHE_DIR" ]]; then
+    mkdir -p "$HTTP_CACHE_DIR"
+    extra_args+=(--http-cache-file "$HTTP_CACHE_DIR/$output_name.http_cache.jsonl")
+  fi
 
   if [[ "$FORCE_RECRAWL" != "1" && -f "$output_dir/summary.json" ]]; then
     if python3 - "$output_dir/summary.json" <<'PY'
@@ -88,6 +103,7 @@ PY
     --max-page-bytes 2000000 \
     --max-sitemap-bytes 50000000 \
     $resume_flag \
+    ${extra_args[@]+"${extra_args[@]}"} \
     >> "$output_dir/stdout.log" 2>> "$output_dir/stderr.log"
 }
 

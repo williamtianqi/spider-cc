@@ -125,15 +125,15 @@ def header_get(headers, name, default=""):
     return default
 
 
-def fetch_bytes_once(url, timeout, max_bytes):
-    req = Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,*/*;q=0.8",
-            "Accept-Encoding": "gzip",
-        },
-    )
+def fetch_bytes_once(url, timeout, max_bytes, extra_headers=None):
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,*/*;q=0.8",
+        "Accept-Encoding": "gzip",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    req = Request(url, headers=headers)
     with urlopen(req, timeout=timeout) as response:
         chunks = []
         total = 0
@@ -154,16 +154,16 @@ def fetch_bytes_once(url, timeout, max_bytes):
         return status, final_url, headers, data
 
 
-def fetch_bytes(url, timeout, max_bytes, retries=2, backoff_seconds=1.0):
+def fetch_bytes(url, timeout, max_bytes, retries=2, backoff_seconds=1.0, extra_headers=None):
     last_error = None
     for attempt in range(retries + 1):
         try:
-            return fetch_bytes_once(url, timeout, max_bytes)
+            return fetch_bytes_once(url, timeout, max_bytes, extra_headers=extra_headers)
         except ValueError:
             raise
         except HTTPError as exc:
             last_error = exc
-            if 400 <= exc.code < 500 and exc.code != 429:
+            if exc.code == 304 or (400 <= exc.code < 500 and exc.code != 429):
                 raise
             if attempt < retries:
                 time.sleep(backoff_seconds * (attempt + 1))

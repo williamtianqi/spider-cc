@@ -189,7 +189,7 @@ def fetch_feed_worker(item, timeout, max_page_bytes):
         return {"record": record, "extract_input": None, "outlinks": []}
 
 
-def fetch_worker(item, timeout, max_page_bytes, max_sitemap_bytes, host_semaphores, host_lock, max_host_workers, extract_mode, link_mode, write_full_text):
+def fetch_worker(item, timeout, max_page_bytes, max_sitemap_bytes, host_semaphores, host_lock, max_host_workers, extract_mode, link_mode, write_full_text, http_cache=None):
     semaphore = base.get_host_semaphore(item["url"], host_semaphores, host_lock, max_host_workers)
     if semaphore:
         semaphore.acquire()
@@ -207,9 +207,29 @@ def fetch_worker(item, timeout, max_page_bytes, max_sitemap_bytes, host_semaphor
             "ok": False,
         }
         try:
-            status, final_url, headers, data = base.fetch_bytes(item["url"], timeout, max_page_bytes)
+            extra_headers = None
+            cached = http_cache.get(item["url_hash"]) if http_cache else None
+            if cached:
+                extra_headers = {}
+                if cached.get("etag"):
+                    extra_headers["If-None-Match"] = cached["etag"]
+                if cached.get("last_modified"):
+                    extra_headers["If-Modified-Since"] = cached["last_modified"]
+            try:
+                status, final_url, headers, data = base.fetch_bytes(item["url"], timeout, max_page_bytes, extra_headers=extra_headers)
+            except base.HTTPError as exc:
+                if exc.code == 304:
+                    record.update({"status": 304, "ok": True, "not_modified": True})
+                    return {"record": record, "extract_input": None, "outlinks": [], "not_modified": True}
+                raise
             content_type = base.header_get(headers, "Content-Type")
             record.update({"status": status, "final_url": final_url, "content_type": content_type, "bytes": len(data)})
+            cache_entry = None
+            if status == 200:
+                etag = base.header_get(headers, "ETag")
+                last_modified = base.header_get(headers, "Last-Modified")
+                if etag or last_modified:
+                    cache_entry = {"url_hash": item["url_hash"], "url": item["url"], "etag": etag, "last_modified": last_modified}
             if status != 200 or "html" not in content_type.lower():
                 record["error"] = "non_html_or_non_200"
                 return {"record": record, "extract_input": None, "outlinks": []}
@@ -225,8 +245,8 @@ def fetch_worker(item, timeout, max_page_bytes, max_sitemap_bytes, host_semaphor
                 else:
                     title, text, extractor = fast_extract_content(html, final_url)
                 extracted = build_extracted(item, final_url, title, text, extractor, write_full_text)
-                return {"record": record, "extracted": extracted, "extract_input": None, "outlinks": outlinks}
-            return {"record": record, "extracted": None, "extract_input": {"html": html, "url": final_url, "item": item}, "outlinks": outlinks}
+                return {"record": record, "extracted": extracted, "extract_input": None, "outlinks": outlinks, "cache_entry": cache_entry}
+            return {"record": record, "extracted": None, "extract_input": {"html": html, "url": final_url, "item": item}, "outlinks": outlinks, "cache_entry": cache_entry}
         except Exception as exc:
             record["error"] = repr(exc)
             return {"record": record, "extract_input": None, "outlinks": []}
@@ -335,9 +355,10 @@ def load_manifest_stats(path):
     fetched = 0
     ok = 0
     duplicate_content = 0
+    not_modified = 0
     path = Path(path)
     if not path.exists():
-        return {"fetched": 0, "ok": 0, "duplicate_content": 0}
+        return {"fetched": 0, "ok": 0, "duplicate_content": 0, "not_modified": 0}
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -352,7 +373,56 @@ def load_manifest_stats(path):
                 ok += 1
             if row.get("content_duplicate"):
                 duplicate_content += 1
-    return {"fetched": fetched, "ok": ok, "duplicate_content": duplicate_content}
+            if row.get("not_modified"):
+                not_modified += 1
+    return {"fetched": fetched, "ok": ok, "duplicate_content": duplicate_content, "not_modified": not_modified}
+
+
+def load_http_cache(path):
+    """Load url_hash -> {etag, last_modified} from a JSONL cache written by
+    previous runs. Later lines win so the freshest validators are used."""
+    cache = {}
+    if not path:
+        return cache
+    p = Path(path)
+    if not p.exists():
+        return cache
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            url_hash = row.get("url_hash")
+            if url_hash:
+                cache[url_hash] = {"etag": row.get("etag", ""), "last_modified": row.get("last_modified", "")}
+    return cache
+
+
+def load_seed_urls(path):
+    """Read extra frontier seed URLs (e.g. exported from the Common Crawl
+    index by cc_index_url_seeder.py). Accepts JSONL rows with a \"url\" field
+    or plain one-URL-per-line text; lines starting with # are ignored."""
+    urls = []
+    with Path(path).open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("{"):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                url = row.get("url", "")
+            else:
+                url = line
+            if url:
+                urls.append(url)
+    return urls
 
 
 def load_frontier_checkpoint(path):
@@ -434,6 +504,8 @@ def parse_args():
     parser.add_argument("--max-sitemap-bytes", type=int, default=50000000)
     parser.add_argument("--write-full-text", action="store_true")
     parser.add_argument("--resume", action="store_true", help="Resume from an existing incomplete run in --output-dir using the periodic frontier checkpoint, discovered_urls.jsonl and pages.jsonl instead of restarting from the seed URL.")
+    parser.add_argument("--seed-urls-file", help="Extra frontier seed URLs (JSONL with a url field, or plain text one URL per line), e.g. the per-domain URL list exported from the Common Crawl index by cc_index_url_seeder.py. Loaded once on fresh starts; ignored on --resume because those URLs are already in discovered_urls.jsonl.")
+    parser.add_argument("--http-cache-file", help="JSONL file persisting ETag/Last-Modified validators per url_hash across runs. When provided, revisited URLs are fetched conditionally and HTTP 304 responses are counted as not_modified instead of re-downloading unchanged bodies.")
     return parser.parse_args()
 
 
@@ -473,6 +545,7 @@ def main():
             "ok": manifest_stats["ok"],
             "unique_text": len(content_hashes),
             "duplicate_content": manifest_stats["duplicate_content"],
+            "not_modified": manifest_stats["not_modified"],
             "links": count_jsonl_lines(output_dir / "links.jsonl") if not args.no_write_links else 0,
             "reject_counts": Counter(),
         }
@@ -487,9 +560,13 @@ def main():
             "ok": 0,
             "unique_text": 0,
             "duplicate_content": 0,
+            "not_modified": 0,
             "links": 0,
             "reject_counts": Counter(),
         }
+
+    http_cache = load_http_cache(args.http_cache_file)
+    http_cache_f = Path(args.http_cache_file).open("a", encoding="utf-8") if args.http_cache_file else None
 
     file_mode = "a" if resume else "w"
     discovered_f = (output_dir / "discovered_urls.jsonl").open(file_mode, encoding="utf-8")
@@ -515,6 +592,11 @@ def main():
             enqueue(queue, seen, discovered_f, counters, seed_url, "seed", 0, "", allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_discovered, check_robots_on_enqueue)
             for page in sitemap_pages:
                 enqueue(queue, seen, discovered_f, counters, page["url"], "sitemap", 0, "", allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_discovered, check_robots_on_enqueue)
+            if args.seed_urls_file:
+                seed_urls = load_seed_urls(args.seed_urls_file)
+                for url in seed_urls:
+                    enqueue(queue, seen, discovered_f, counters, url, "cc_index_seed", 0, "", allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_discovered, check_robots_on_enqueue)
+                log_line(log_path, f"seed_urls_file loaded path={args.seed_urls_file} urls={len(seed_urls)} frontier={len(queue)}")
 
         fetch_futures = {}
         extract_futures = {}
@@ -529,7 +611,7 @@ def main():
                     if args.robots_check_stage == "fetch" and not base.can_fetch(item["url"], robots_cache, args.timeout, args.max_page_bytes):
                         counters["reject_counts"]["robots_disallow"] += 1
                         continue
-                    future = fetch_pool.submit(fetch_worker, item, args.timeout, args.max_page_bytes, args.max_sitemap_bytes, host_semaphores, host_lock, args.max_host_workers, args.extract_mode, args.link_mode, args.write_full_text)
+                    future = fetch_pool.submit(fetch_worker, item, args.timeout, args.max_page_bytes, args.max_sitemap_bytes, host_semaphores, host_lock, args.max_host_workers, args.extract_mode, args.link_mode, args.write_full_text, http_cache)
                     fetch_futures[future] = item
                     counters["scheduled"] += 1
                 if not fetch_futures and not extract_futures:
@@ -544,8 +626,12 @@ def main():
                         result = future.result()
                         record = result["record"]
                         counters["fetched"] += 1
-                        if result.get("extracted") or result.get("extract_input"):
+                        if result.get("extracted") or result.get("extract_input") or result.get("not_modified"):
                             counters["ok"] += 1
+                        if result.get("not_modified"):
+                            counters["not_modified"] += 1
+                        if result.get("cache_entry") and http_cache_f is not None:
+                            write_jsonl_row(http_cache_f, result["cache_entry"])
                         if result.get("extracted"):
                             write_extracted_record(record, result["extracted"], content_hashes, counters, pages_f, manifest_f)
                         elif not result.get("extract_input"):
@@ -570,7 +656,7 @@ def main():
                         extracted = future.result()
                         write_extracted_record(record, extracted, content_hashes, counters, pages_f, manifest_f)
                 if counters["fetched"] >= next_progress_at:
-                    flush_handles(discovered_f, links_f, manifest_f, pages_f, sitemap_f)
+                    flush_handles(discovered_f, links_f, manifest_f, pages_f, sitemap_f, http_cache_f)
                     write_frontier_checkpoint(output_dir, queue)
                     snapshot = progress_snapshot(args, started, counters["scheduled"], counters["fetched"], counters["ok"], counters["unique_text"], counters["duplicate_content"], queue, counters["discovered"], counters["links"], counters["reject_counts"], len(fetch_futures), len(extract_futures))
                     write_progress(output_dir, snapshot)
@@ -610,6 +696,9 @@ def main():
             "ok_manifest_records": counters["ok"],
             "unique_text_pages": counters["unique_text"],
             "duplicate_content_pages": counters["duplicate_content"],
+            "not_modified_pages": counters["not_modified"],
+            "seed_urls_file": args.seed_urls_file or "",
+            "http_cache_file": args.http_cache_file or "",
             "remaining_frontier": len(queue),
             "site_crawl_complete": site_crawl_complete,
             "stopped_reason": stopped_reason,
@@ -633,7 +722,7 @@ def main():
             checkpoint_path.unlink()
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     finally:
-        for handle in [discovered_f, links_f, manifest_f, pages_f, sitemap_f]:
+        for handle in [discovered_f, links_f, manifest_f, pages_f, sitemap_f, http_cache_f]:
             if handle is not None:
                 handle.close()
         if pid_lock_path.exists():
