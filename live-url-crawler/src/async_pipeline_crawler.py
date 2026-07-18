@@ -700,9 +700,12 @@ def parse_args():
     parser.add_argument("--partial-jsonl", default="cc_async_pages_partial.jsonl")
     parser.add_argument("--latest-json", default="cc_async_run_latest.json")
     parser.add_argument(
-        "--impersonate", action=argparse.BooleanOptionalAction, default=True,
-        help="用 curl_cffi 模拟真实浏览器 TLS/JA3/HTTP2 指纹 (需要 pip install curl_cffi); "
-             "--no-impersonate 强制退回 aiohttp 裸连接",
+        "--impersonate", dest="impersonate", action="store_true", default=True,
+        help="用 curl_cffi 模拟真实浏览器 TLS/JA3/HTTP2 指纹 (需要 pip install curl_cffi, 默认开启)",
+    )
+    parser.add_argument(
+        "--no-impersonate", dest="impersonate", action="store_false",
+        help="强制退回 aiohttp 裸连接, 不做 TLS 指纹伪装",
     )
     return parser.parse_args()
 

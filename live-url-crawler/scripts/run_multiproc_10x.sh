@@ -38,4 +38,5 @@ python3 src/multiproc_async_crawler.py \
   --timeout 5 \
   --stats-jsonl cc_multiproc_10x_stats.jsonl \
   --partial-jsonl cc_multiproc_10x_partial.jsonl \
-  --latest-json cc_multiproc_10x_latest.json
+  --latest-json cc_multiproc_10x_latest.json \
+  "${@:6}"

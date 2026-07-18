@@ -22,19 +22,38 @@ try:
 except ImportError:
     HAS_CURL_CFFI = False
 
-# 当前已安装 curl_cffi 版本实际支持的较新 profile (跨 chrome/firefox/safari/edge 分布,
-# 避免全部请求都用同一个指纹). 同一个域名在同一次运行中会稳定映射到同一个 profile
-# (真实浏览器同一个会话内 TLS 指纹不会变), 不同域名之间指纹分布是多样的。
-IMPERSONATE_PROFILES = [
+# 候选 profile (跨 chrome/firefox/safari/edge 分布, 避免全部请求都用同一个指纹)。
+# curl_cffi 不同版本支持的 impersonate profile 集合差异很大 (旧版本没有较新的
+# chrome136/firefox135/safari184 等), 用不存在的 profile 调用会抛 ImpersonateError,
+# 导致该域名的所有请求永久失败。启动时用实际安装版本的 BrowserType 枚举过滤一遍,
+# 只保留真正可用的 profile, 而不是硬编码假设某个固定版本。
+_CANDIDATE_PROFILES = [
     "chrome136",
+    "chrome133a",
     "chrome131",
     "chrome124",
     "firefox135",
     "firefox133",
     "safari184",
     "safari260",
+    "safari180",
+    "safari18_0",
     "edge101",
 ]
+
+if HAS_CURL_CFFI:
+    try:
+        from curl_cffi.requests.impersonate import BrowserType as _BrowserType
+        _available = {member.value for member in _BrowserType}
+        IMPERSONATE_PROFILES = [p for p in _CANDIDATE_PROFILES if p in _available]
+    except Exception:
+        IMPERSONATE_PROFILES = []
+    if not IMPERSONATE_PROFILES:
+        # 反射失败或候选全部不匹配时的最后兜底: chrome99/edge99 几乎所有 curl_cffi
+        # 版本都支持。
+        IMPERSONATE_PROFILES = ["chrome99", "edge99"]
+else:
+    IMPERSONATE_PROFILES = _CANDIDATE_PROFILES
 
 # curl_cffi 不可用时的降级方案: 真实浏览器 UA 字符串轮换池 (仅伪装请求头, 不涉及 TLS 层)。
 FALLBACK_USER_AGENTS = [

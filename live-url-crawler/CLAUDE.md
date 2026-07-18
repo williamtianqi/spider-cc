@@ -106,16 +106,21 @@ Important features:
 
 ### Live Crawl
 
-`src/pipeline_domain_crawler.py` performs live site crawling with:
+Three interchangeable engines share the same discovery/dedup/extraction/anti-bot logic, differing only in concurrency model:
 
-- sitemap discovery
-- robots handling
-- live HTML fetching
-- regex-inline content extraction
-- regex link extraction
-- per-site `pages.jsonl`
-- per-site `progress.json`
-- per-site `summary.json`
+- `src/pipeline_domain_crawler.py` (turbo): thread-pool fetcher + process-pool extractor, single process.
+- `src/async_pipeline_crawler.py` (async): single-process asyncio, global connection pool + per-host semaphore, interleaved multi-site scheduling.
+- `src/multiproc_async_crawler.py` (multiproc-async): N processes, each running one async engine over a shard of sites; use this for single-machine multi-core scale-out.
+
+All three include:
+
+- sitemap discovery, robots handling, regex-inline content extraction, regex link extraction
+- retry with backoff for 429/5xx/timeouts (respects `Retry-After`), challenge-page (Cloudflare/WAF) detection
+- per-site `summary.json` with `likely_blocked` + `error_reasons` so permanent blocking is distinguishable from "this site is just small"
+- `src/browser_fingerprint.py` + `curl_cffi`: TLS/JA3/JA4 browser fingerprint impersonation (profile pool filtered against the installed `curl_cffi` version's actual `BrowserType` support at import time); falls back to rotated real-browser UA strings when `curl_cffi` is absent. Async/multiproc expose `--impersonate/--no-impersonate`.
+- per-site `pages.jsonl` / `progress.json`
+
+See `PIPELINE_ANALYSIS.md` section 9 for the anti-bot fixes and cross-`curl_cffi`-version compatibility issues found/fixed.
 
 ### Multi-site Runner
 
