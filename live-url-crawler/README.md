@@ -1,8 +1,25 @@
 # Live URL Crawler
 
-面向 AI 搜索数据源的真实站点最新抓取系统。
+面向 AI 搜索数据源的真实站点最新抓取系统:给定域名/种子 URL/Common Crawl 站点列表,自动发现该站点下的可抓 URL(sitemap、feed、内链 BFS),真实 live 请求抓取,本地抽取正文,输出结构化 JSONL。
 
-这个项目聚焦 live crawl，不把 Common Crawl 当最终正文来源。Common Crawl 只适合做站点/URL 发现和冷启动种子；最终正文永远是对目标站点的一次真实 live 请求后本地抽取的结果。
+这个项目聚焦 **live crawl**,不把 Common Crawl 当最终正文来源。Common Crawl 只适合做站点/URL 发现和冷启动种子;最终正文永远是对目标站点的一次真实 live 请求后本地抽取的结果,保证新鲜度和版权/授权链路清晰。
+
+## 项目现状
+
+| 模块 | 状态 | 说明 |
+| --- | --- | --- |
+| URL 发现 | ✅ 已验证 | sitemap(含 sitemap index)、RSS/Atom feed、页面内链 BFS、robots.txt 合规 |
+| 正文抽取 | ✅ 已验证 | `trafilatura`,不可用时降级内置 HTMLParser;exact content hash 去重 |
+| 三档抓取引擎 | ✅ 已验证可跑通 | turbo(同步线程池)/ async(单进程 asyncio)/ multiproc-async(多进程横向扩展),见下表 |
+| 反爬检测 + TLS 指纹伪装 | ✅ 已验证 | 429/5xx 重试、验证码/WAF 挑战页识别、`curl_cffi` JA3/JA4 浏览器指纹伪装,已用 mock server 三场景 + 真实 `tls.browserleaks.com` JA4 校验通过 |
+| Common Crawl 集成 | ✅ 已验证 | WET 站点发现 + CDX index 按域名导出源头去重 URL 种子 |
+| HTTP 条件请求缓存 | ✅ 已验证 | ETag/Last-Modified 304 增量重访 |
+| 大规模多站点真实吞吐 | ⚠️ 待压测 | 单机/单站点已验证功能正确性,尚未在大规模真实站点集上重新测过 async/multiproc 引擎的稳定吞吐 |
+| 跨机器分布式部署 | 📝 设计阶段 | `PLAN_200B.md` 是面向百亿级页面的分片方案设计,尚未实际跑通多机器部署 |
+
+图例:✅ 已验证可用 · ⚠️ 功能可用但规模化数据待补 · 📝 仅有设计文档,未实现/未跑通。
+
+细节和已知问题清单见 `PIPELINE_ANALYSIS.md`(逐次迭代记录,含每次修复前后的对比验证)。
 
 ## 三档抓取引擎
 
