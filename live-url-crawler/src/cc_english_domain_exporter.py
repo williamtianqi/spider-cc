@@ -63,10 +63,26 @@ def parse_args():
     return parser.parse_args()
 
 
-def list_index_files(crawl_id, timeout=60):
+def list_index_files(crawl_id, timeout=60, max_retries=8):
     paths_url = f"{DATA_BASE_URL}crawl-data/{crawl_id}/cc-index-table.paths.gz"
-    with urlopen(paths_url, timeout=timeout) as response:
-        paths = gzip.decompress(response.read()).decode("utf-8").splitlines()
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urlopen(paths_url, timeout=timeout) as response:
+                paths = gzip.decompress(response.read()).decode("utf-8").splitlines()
+            break
+        except OSError as error:
+            if attempt == max_retries:
+                raise
+            delay = 900 if "403" in str(error) else min(120, 2**attempt)
+            emit_progress(
+                {
+                    "stage": "retry_paths",
+                    "attempt": attempt,
+                    "sleep_seconds": delay,
+                    "error": str(error).splitlines()[0],
+                }
+            )
+            time.sleep(delay)
     warc_paths = [p for p in paths if "/subset=warc/" in p and p.endswith(".parquet")]
     return [DATA_BASE_URL + p for p in sorted(warc_paths)]
 
