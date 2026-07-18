@@ -161,7 +161,6 @@ def export_domain_urls(domain, output_name, args):
                         break
                 if args.page_delay > 0:
                     time.sleep(args.page_delay)
-        counters["exported_urls"] = exported
         return {
             "domain": domain,
             "output_name": output_name,

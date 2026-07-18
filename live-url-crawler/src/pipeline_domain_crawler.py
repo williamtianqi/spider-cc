@@ -24,6 +24,18 @@ def flush_handles(*handles):
             handle.flush()
 
 
+CHALLENGE_MARKERS = (
+    "checking your browser",
+    "just a moment",
+    "cf-browser-verification",
+    "cf-chl-",
+    "verify you are human",
+    "enable javascript and cookies",
+    "attention required! | cloudflare",
+    "captcha",
+    "access denied",
+)
+BLOCKING_ERROR_REASONS = {"http_403", "http_429", "http_503", "challenge_page"}
 HREF_RE = re.compile(r'''(?i)\bhref\s*=\s*["']([^"'#\s>]+)["']''')
 TITLE_RE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
 SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style|noscript|svg|canvas|template)[^>]*>.*?</\1>")
@@ -221,7 +233,8 @@ def fetch_worker(item, timeout, max_page_bytes, max_sitemap_bytes, host_semaphor
                 if exc.code == 304:
                     record.update({"status": 304, "ok": True, "not_modified": True})
                     return {"record": record, "extract_input": None, "outlinks": [], "not_modified": True}
-                raise
+                record.update({"status": exc.code, "error": f"http_{exc.code}"})
+                return {"record": record, "extract_input": None, "outlinks": []}
             content_type = base.header_get(headers, "Content-Type")
             record.update({"status": status, "final_url": final_url, "content_type": content_type, "bytes": len(data)})
             cache_entry = None
@@ -230,9 +243,15 @@ def fetch_worker(item, timeout, max_page_bytes, max_sitemap_bytes, host_semaphor
                 last_modified = base.header_get(headers, "Last-Modified")
                 if etag or last_modified:
                     cache_entry = {"url_hash": item["url_hash"], "url": item["url"], "etag": etag, "last_modified": last_modified}
-            if status != 200 or "html" not in content_type.lower():
-                record["error"] = "non_html_or_non_200"
+            if status != 200:
+                record["error"] = f"http_{status}"
                 return {"record": record, "extract_input": None, "outlinks": []}
+            if "html" not in content_type.lower():
+                record["error"] = "non_html"
+                return {"record": record, "extract_input": None, "outlinks": []}
+            if any(marker in data[:4096].decode("utf-8", errors="ignore").lower() for marker in CHALLENGE_MARKERS):
+                record["error"] = "challenge_page"
+                return {"record": record, "extract_input": None, "outlinks": [], "cache_entry": cache_entry}
             html = decode_html_bytes(data, headers)
             page_links = regex_extract_page_links(html, final_url) if link_mode == "regex" else base.extract_page_links(html, final_url)
             record["canonical"] = page_links["canonical"]
@@ -356,9 +375,10 @@ def load_manifest_stats(path):
     ok = 0
     duplicate_content = 0
     not_modified = 0
+    error_reasons = Counter()
     path = Path(path)
     if not path.exists():
-        return {"fetched": 0, "ok": 0, "duplicate_content": 0, "not_modified": 0}
+        return {"fetched": 0, "ok": 0, "duplicate_content": 0, "not_modified": 0, "error_reasons": error_reasons}
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -375,7 +395,9 @@ def load_manifest_stats(path):
                 duplicate_content += 1
             if row.get("not_modified"):
                 not_modified += 1
-    return {"fetched": fetched, "ok": ok, "duplicate_content": duplicate_content, "not_modified": not_modified}
+            if row.get("error"):
+                error_reasons[row["error"]] += 1
+    return {"fetched": fetched, "ok": ok, "duplicate_content": duplicate_content, "not_modified": not_modified, "error_reasons": error_reasons}
 
 
 def load_http_cache(path):
@@ -548,6 +570,7 @@ def main():
             "not_modified": manifest_stats["not_modified"],
             "links": count_jsonl_lines(output_dir / "links.jsonl") if not args.no_write_links else 0,
             "reject_counts": Counter(),
+            "error_reasons": manifest_stats["error_reasons"],
         }
     else:
         queue = deque()
@@ -563,6 +586,7 @@ def main():
             "not_modified": 0,
             "links": 0,
             "reject_counts": Counter(),
+            "error_reasons": Counter(),
         }
 
     http_cache = load_http_cache(args.http_cache_file)
@@ -626,6 +650,8 @@ def main():
                         result = future.result()
                         record = result["record"]
                         counters["fetched"] += 1
+                        if record.get("error"):
+                            counters["error_reasons"][record["error"]] += 1
                         if result.get("extracted") or result.get("extract_input") or result.get("not_modified"):
                             counters["ok"] += 1
                         if result.get("not_modified"):
@@ -677,6 +703,8 @@ def main():
         elif len(queue) > 0 and counters["discovered"] >= args.max_discovered:
             stopped_reason = "max_discovered_reached"
         site_crawl_complete = len(queue) == 0 and stopped_reason == "frontier_exhausted"
+        blocking_errors = sum(v for k, v in counters["error_reasons"].items() if k in BLOCKING_ERROR_REASONS)
+        likely_blocked = counters["unique_text"] == 0 and counters["fetched"] > 0 and blocking_errors >= max(1, counters["fetched"] * 0.5)
         summary = {
             "seed_url": seed_url,
             "allowed_hosts": sorted(allowed_hosts),
@@ -702,6 +730,8 @@ def main():
             "remaining_frontier": len(queue),
             "site_crawl_complete": site_crawl_complete,
             "stopped_reason": stopped_reason,
+            "likely_blocked": likely_blocked,
+            "error_reasons": dict(counters["error_reasons"].most_common(10)),
             "link_edges": counters["links"],
             "reject_counts": dict(counters["reject_counts"]),
             "elapsed_seconds": round(time.time() - started, 2),

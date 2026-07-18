@@ -13,9 +13,12 @@ from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
+from email.message import Message
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, quote, urlencode, urldefrag, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+import browser_fingerprint as fp
 
 try:
     import trafilatura
@@ -23,6 +26,13 @@ try:
 except Exception:
     trafilatura = None
     extract_metadata = None
+
+try:
+    import curl_cffi.requests as cffi_requests
+    from curl_cffi.requests import RequestsError as CffiRequestsError
+except ImportError:
+    cffi_requests = None
+    CffiRequestsError = Exception
 
 USER_AGENT = "domain-link-crawler/0.1"
 STATIC_EXTENSIONS = {
@@ -126,8 +136,23 @@ def header_get(headers, name, default=""):
 
 
 def fetch_bytes_once(url, timeout, max_bytes, extra_headers=None):
+    """抓取 url 原始字节。优先用 curl_cffi 做浏览器 TLS/JA3 指纹伪装
+    (impersonate=按域名稳定选择的 chrome/firefox/safari profile), curl_cffi
+    未安装时回退到 urllib + 按域名轮换的真实浏览器 UA 字符串。
+
+    返回 (status, final_url, headers_dict, data_bytes)；非 2xx 或 304 会
+    抛出 urllib.error.HTTPError(与两条后端路径保持一致), 由调用方 fetch_bytes
+    / fetch_worker 按 exc.code 做重试或分类。
+    """
+    if cffi_requests is not None:
+        return _fetch_bytes_once_cffi(url, timeout, max_bytes, extra_headers)
+    return _fetch_bytes_once_urllib(url, timeout, max_bytes, extra_headers)
+
+
+def _fetch_bytes_once_urllib(url, timeout, max_bytes, extra_headers=None):
+    host = host_of(url)
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": fp.user_agent_for_host(host),
         "Accept": "text/html,application/xhtml+xml,application/xml,text/xml,*/*;q=0.8",
         "Accept-Encoding": "gzip",
     }
@@ -154,6 +179,47 @@ def fetch_bytes_once(url, timeout, max_bytes, extra_headers=None):
         return status, final_url, headers, data
 
 
+def _fetch_bytes_once_cffi(url, timeout, max_bytes, extra_headers=None):
+    host = host_of(url)
+    profile = fp.profile_for_host(host)
+    headers = {}
+    if extra_headers:
+        headers.update(extra_headers)
+    response = None
+    try:
+        response = cffi_requests.get(
+            url,
+            headers=headers or None,
+            impersonate=profile,
+            timeout=timeout,
+            allow_redirects=True,
+            max_redirects=5,
+            stream=True,
+        )
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"response_too_large:{total}>{max_bytes}")
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        headers_dict = dict(response.headers.items())
+        status = response.status_code
+        final_url = response.url
+    except CffiRequestsError as exc:
+        raise OSError(f"curl_cffi_error:{exc}") from exc
+    finally:
+        if response is not None:
+            response.close()
+    if status == 304 or status >= 400:
+        msg = Message()
+        for key, value in headers_dict.items():
+            msg[key] = value
+        raise HTTPError(url, status, str(status), msg, None)
+    return status, final_url, headers_dict, data
+
+
 def fetch_bytes(url, timeout, max_bytes, retries=2, backoff_seconds=1.0, extra_headers=None):
     last_error = None
     for attempt in range(retries + 1):
@@ -166,12 +232,26 @@ def fetch_bytes(url, timeout, max_bytes, retries=2, backoff_seconds=1.0, extra_h
             if exc.code == 304 or (400 <= exc.code < 500 and exc.code != 429):
                 raise
             if attempt < retries:
-                time.sleep(backoff_seconds * (attempt + 1))
+                time.sleep(retry_after_seconds(exc, backoff_seconds * (attempt + 1)))
         except Exception as exc:
             last_error = exc
             if attempt < retries:
                 time.sleep(backoff_seconds * (attempt + 1))
     raise last_error
+
+
+def retry_after_seconds(http_error, default_seconds):
+    header_value = None
+    try:
+        header_value = http_error.headers.get("Retry-After") if http_error.headers else None
+    except Exception:
+        header_value = None
+    if not header_value:
+        return default_seconds
+    try:
+        return min(float(header_value), 30.0)
+    except ValueError:
+        return default_seconds
 
 
 def normalize_url(raw_url, base_url=None, allow_static=False):
