@@ -245,6 +245,7 @@ print(f'Progress: {total_unique/20_000_000_000*100:.2f}%')
 | 风险 | 应对 |
 |------|------|
 | CC WET 下载失败 | 3 次重试 + backoff (已实现) |
+| 站点封锁/验证码 | 429/5xx/超时重试 + Retry-After + challenge 页检测 + `likely_blocked` 标记 + curl_cffi TLS/JA3 浏览器指纹伪装 (已实现, 见 `PIPELINE_ANALYSIS.md` 第 9 节) |
 | 大站跑不完 | 50000 页 cap + 30min 超时 |
 | 内容重复 | content_hash 全局去重 |
 | IP 被封 | 分散到 16+ IP, per-host 限流 |
