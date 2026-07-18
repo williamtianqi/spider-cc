@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import gzip
-import hashlib
 import io
 import json
 import re

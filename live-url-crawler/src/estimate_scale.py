@@ -46,7 +46,6 @@ def main():
     run_root = Path(args.run_root)
 
     # --- 站点发现采样统计 ---
-    wet_paths_sampled = discovery.get("wet_paths_considered", 0) if discovery else 0
     unique_sites_found = discovery.get("unique_sites", 0) if discovery else 0
     counters = discovery.get("counters", {}) if discovery else {}
     warc_records_scanned = counters.get("warc_records", 0)
@@ -56,7 +55,6 @@ def main():
 
     candidate_rate = candidate_sites / warc_records_scanned if warc_records_scanned else 0
     unique_rate = unique_sites_found / candidate_sites if candidate_sites else 0
-    sites_per_wet = unique_sites_found / ok_wet_files if ok_wet_files else 0
 
     # --- 全 CC 英文站点数估计 ---
     total_warc_records_est = args.cc_total_wet_files * args.cc_avg_records_per_wet
@@ -111,9 +109,6 @@ def main():
     avg_pages_per_site = statistics.mean(site_pages) if site_pages else 0
     avg_pages_nonzero = statistics.mean(site_pages_nonzero) if site_pages_nonzero else 0
     median_pages_nonzero = statistics.median(site_pages_nonzero) if site_pages_nonzero else 0
-
-    # 加上 running sites 的 frontier 作为「潜在可抓」
-    potential_pages_from_frontier = running_frontier
 
     # --- 全量页面数估计 ---
     # 保守估计：用 avg_pages_per_site（含 0 页站点）
