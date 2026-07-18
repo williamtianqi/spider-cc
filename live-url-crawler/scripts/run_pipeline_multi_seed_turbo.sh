@@ -16,15 +16,41 @@ MAX_HOST_WORKERS="${MAX_HOST_WORKERS:-32}"
 MAX_IN_FLIGHT_FETCH="${MAX_IN_FLIGHT_FETCH:-2048}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-6}"
 FORCE_RECRAWL="${FORCE_RECRAWL:-0}"
+# Optional: directory of per-site URL lists exported by cc_index_url_seeder.py
+# ($SEED_URLS_DIR/<output_name>.jsonl is passed as --seed-urls-file when present).
+SEED_URLS_DIR="${SEED_URLS_DIR:-}"
+# Optional: directory for per-site ETag/Last-Modified caches; enables conditional
+# revisit requests (HTTP 304) across daily re-crawls of the same sites.
+HTTP_CACHE_DIR="${HTTP_CACHE_DIR:-}"
 
 mkdir -p "$OUTPUT_ROOT"
 
+
+is_locked_by_live_pid() {
+  local output_dir="$1"
+  local lock_file="$output_dir/pid.lock"
+  [[ -f "$lock_file" ]] || return 1
+  local pid
+  pid="$(cat "$lock_file" 2>/dev/null)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
 
 run_one_seed() {
   local seed_url="$1"
   local scope="$2"
   local output_name="$3"
   local output_dir="$OUTPUT_ROOT/$output_name"
+  local resume_flag=""
+  local extra_args=()
+
+  if [[ -n "$SEED_URLS_DIR" && -f "$SEED_URLS_DIR/$output_name.jsonl" ]]; then
+    extra_args+=(--seed-urls-file "$SEED_URLS_DIR/$output_name.jsonl")
+  fi
+  if [[ -n "$HTTP_CACHE_DIR" ]]; then
+    mkdir -p "$HTTP_CACHE_DIR"
+    extra_args+=(--http-cache-file "$HTTP_CACHE_DIR/$output_name.http_cache.jsonl")
+  fi
 
   if [[ "$FORCE_RECRAWL" != "1" && -f "$output_dir/summary.json" ]]; then
     if python3 - "$output_dir/summary.json" <<'PY'
@@ -43,9 +69,13 @@ PY
       return 0
     fi
   fi
-  if [[ "$FORCE_RECRAWL" != "1" && -f "$output_dir/progress.json" && ! -f "$output_dir/summary.json" ]]; then
-    echo "skip_active_or_incomplete $output_name"
+  if [[ "$FORCE_RECRAWL" != "1" ]] && is_locked_by_live_pid "$output_dir"; then
+    echo "skip_active_live_process $output_name"
     return 0
+  fi
+  if [[ "$FORCE_RECRAWL" != "1" && -f "$output_dir/manifest.jsonl" && ! -f "$output_dir/summary.json" ]]; then
+    echo "resume_incomplete $output_name"
+    resume_flag="--resume"
   fi
 
   mkdir -p "$output_dir"
@@ -72,7 +102,9 @@ PY
     --timeout "$TIMEOUT_SECONDS" \
     --max-page-bytes 2000000 \
     --max-sitemap-bytes 50000000 \
-    > "$output_dir/stdout.log" 2> "$output_dir/stderr.log"
+    $resume_flag \
+    ${extra_args[@]+"${extra_args[@]}"} \
+    >> "$output_dir/stdout.log" 2>> "$output_dir/stderr.log"
 }
 
 while IFS=$'\t' read -r seed_url scope output_name; do

@@ -1,23 +1,72 @@
 # Live URL Crawler
 
-面向 AI 搜索数据源的真实站点最新抓取 demo。
+面向 AI 搜索数据源的真实站点最新抓取系统:给定域名/种子 URL/Common Crawl 站点列表,自动发现该站点下的可抓 URL(sitemap、feed、内链 BFS),真实 live 请求抓取,本地抽取正文,输出结构化 JSONL。
 
-这个项目聚焦 live crawl，不把 Common Crawl 当最终正文来源。Common Crawl 只适合做站点发现、URL pattern 发现和冷启动。
+这个项目聚焦 **live crawl**,不把 Common Crawl 当最终正文来源。Common Crawl 只适合做站点/URL 发现和冷启动种子;最终正文永远是对目标站点的一次真实 live 请求后本地抽取的结果,保证新鲜度和版权/授权链路清晰。
+
+## 项目现状
+
+| 模块 | 状态 | 说明 |
+| --- | --- | --- |
+| URL 发现 | ✅ 已验证 | sitemap(含 sitemap index)、RSS/Atom feed、页面内链 BFS、robots.txt 合规 |
+| 正文抽取 | ✅ 已验证 | `trafilatura`,不可用时降级内置 HTMLParser;exact content hash 去重 |
+| 三档抓取引擎 | ✅ 已验证可跑通 | turbo(同步线程池)/ async(单进程 asyncio)/ multiproc-async(多进程横向扩展),见下表 |
+| 反爬检测 + TLS 指纹伪装 | ✅ 已验证 | 429/5xx 重试、验证码/WAF 挑战页识别、`curl_cffi` JA3/JA4 浏览器指纹伪装,已用 mock server 三场景 + 真实 `tls.browserleaks.com` JA4 校验通过 |
+| Common Crawl 集成 | ✅ 已验证 | WET 站点发现 + CDX index 按域名导出源头去重 URL 种子 |
+| HTTP 条件请求缓存 | ✅ 已验证 | ETag/Last-Modified 304 增量重访 |
+| 大规模多站点真实吞吐 | ⚠️ 待压测 | 单机/单站点已验证功能正确性,尚未在大规模真实站点集上重新测过 async/multiproc 引擎的稳定吞吐 |
+| 跨机器分布式部署 | 📝 设计阶段 | `PLAN_200B.md` 是面向百亿级页面的分片方案设计,尚未实际跑通多机器部署 |
+
+图例:✅ 已验证可用 · ⚠️ 功能可用但规模化数据待补 · 📝 仅有设计文档,未实现/未跑通。
+
+细节和已知问题清单见 `PIPELINE_ANALYSIS.md`(逐次迭代记录,含每次修复前后的对比验证)。
+
+## 三档抓取引擎
+
+| 引擎 | 文件 | 模型 | 适合场景 |
+| --- | --- | --- | --- |
+| Turbo(同步) | `src/pipeline_domain_crawler.py` + `src/domain_link_crawler.py` | 线程池 fetcher + 进程池 extractor | 单站深度全量覆盖,调试友好 |
+| Async(单进程) | `src/async_pipeline_crawler.py` | 单进程 asyncio,全局连接池 + per-host 限流,多站点交错调度 | 单机大规模并发多站抓取;代码里设计目标 2048+ 全局并发 / 1500+ pages/s |
+| Multiproc-Async | `src/multiproc_async_crawler.py` | N 个进程,每个进程内跑一套 Async 引擎处理一部分站点 | 单机多核横向扩展 Async 引擎;设计目标 N × 单进程速率 |
+
+三档引擎共享同一套 URL 发现/去重/正文抽取/反爬逻辑,区别只在调度模型和并发实现,可以按机器规格和目标站点数选择。`PLAN_200B.md` 有面向百亿级页面的分片部署方案。
+
+## 反爬检测与浏览器指纹伪装
+
+三档引擎都具备:
+
+- **失败重试**:429 / 5xx / 超时 / 连接错误最多重试 3 次,遵守服务端 `Retry-After`。
+- **验证码/WAF 挑战页识别**:命中 Cloudflare "Just a moment"、`cf-chl-`、`captcha` 等特征直接判失败,不会被当成正文吃进库。
+- **`likely_blocked` + `error_reasons`**:每个站点的 `summary.json` 会标记是否疑似被永久拦截,以及失败原因分布,和"这个站本来页面就少"区分开。
+- **TLS/JA3/JA4 浏览器指纹伪装**(`src/browser_fingerprint.py` + [`curl_cffi`](https://github.com/lexiforest/curl_cffi)):按域名稳定映射到 `chrome136`/`firefox135`/`safari184`/`edge101` 等真实浏览器 impersonate profile,同时自动带上匹配的 UA / `sec-ch-ua` / `Accept-Language`,比裸 `urllib`/`aiohttp`(默认走 Python `ssl` 指纹,和真实浏览器在 TLS 握手层就能被区分)更接近真实浏览器流量。`curl_cffi` 未安装时自动降级为按域名轮换真实浏览器 UA 字符串的 `urllib`/`aiohttp` 路径,不影响功能。
+- Async/Multiproc 引擎新增 `--impersonate` / `--no-impersonate`(默认开启),可强制关闭指纹伪装退回裸连接。
+
+已用本地 anti-bot mock server(永久 429、429 重试后恢复、Cloudflare 假挑战页三种场景)和真实 HTTPS 站点(`tls.browserleaks.com` JA4 校验、`example.com` 端到端抽取)验证。详见 `PIPELINE_ANALYSIS.md` 第 9 节。
+
+## Common Crawl 集成
+
+Common Crawl 只用来发现"抓哪些站/哪些 URL",不作为正文来源:
+
+- `src/common_crawl_site_discovery.py`:批量下载解析 WET 文件,从 `WARC-Target-URI` 提取候选站点,支持英文域名过滤、垂直采样(`--spread-wet-paths`)、`--processed-wets-file` 跨 run 去重(已消费的 WET 不会重复下载解析)。
+- `src/cc_index_url_seeder.py`:按域名查询 CDX API(`index.commoncrawl.org`),导出该域名下的 `url + digest + mime + status` 列表;同 content digest 的 URL 组只导出一条,做**源头去重**;`--processed-domains-file` 跨 run 登记已导出域名。导出结果可通过 `--seed-urls-file` 直接灌入 turbo/async 引擎的 frontier,深层孤岛页(无内链、不在 sitemap)不必再靠 live BFS 重新发现。
+- **HTTP 条件请求缓存**(`--http-cache-file`,turbo 引擎):持久化每个 URL 的 `ETag`/`Last-Modified`,重访命中 304 时不重新下载 body、不重复抽取正文,计入 `not_modified_pages`。适合"每天重访同一批站点"场景。
 
 ## 当前能力
 
 - 域名级内部链接递归发现
-- 通用 sitemap 发现
+- 通用 sitemap 发现 + sitemap index 递归解析
 - robots.txt 合规检查
-- sitemap index 递归解析
 - RSS/Atom feed URL 发现
 - 页面内链 BFS 扩展
-- URL 规范化
-- URL hash 去重
+- URL 规范化 + URL hash 去重
 - 二进制/静态资源过滤
-- trafilatura 开源正文抽取
+- trafilatura 开源正文抽取(不可用时降级到内置 HTMLParser)
 - exact content hash 去重
-- 并发抓取
+- 失败重试 + 验证码/WAF 检测 + `likely_blocked` 标记
+- TLS/JA3 浏览器指纹伪装,`curl_cffi` 缺失时自动降级
+- HTTP 条件请求缓存(304 增量重访)
+- Common Crawl CDX index 源头 URL 去重种子
+- 并发抓取(线程池 / asyncio / 多进程 asyncio 三档可选)
 - 单页面最大字节限制
 - 输出 discovered URLs、links、manifest、正文抽取结果、剩余 frontier
 
@@ -52,6 +101,12 @@ python3 -m pip install --index-url https://pypi.org/simple -r requirements.txt
 
 如果你的 pip 默认源是私有源且凭证失效，需要显式加 `--index-url https://pypi.org/simple`。
 
+`requirements.txt` 包含:
+
+- `trafilatura` — 正文抽取(缺失时降级到内置 HTMLParser)
+- `aiohttp` — Async/Multiproc 引擎的异步 HTTP 客户端
+- `curl_cffi` — TLS/JA3 浏览器指纹伪装(缺失时自动降级为 `urllib`/`aiohttp` 裸连接,不影响功能)
+
 ## 快速运行
 
 域名级递归抓取：
@@ -60,10 +115,29 @@ python3 -m pip install --index-url https://pypi.org/simple -r requirements.txt
 bash scripts/run_domain_docs_python_small.sh
 ```
 
-高吞吐主从流水线抓取：
+高吞吐主从流水线抓取(turbo,同步)：
 
 ```bash
 bash scripts/run_pipeline_docs_python_fast.sh
+```
+
+单进程异步引擎抓取(Async)：
+
+```bash
+bash scripts/run_async_crawl_10x.sh cc_seed_sites_100x_en.tsv data/runs/cc_async_10x 20000 100000 2048 512
+```
+
+多进程异步引擎抓取(Multiproc-Async，单机多核横向扩展)：
+
+```bash
+bash scripts/run_multiproc_10x.sh cc_seed_sites_100x_en.tsv data/runs/cc_multiproc_10x 8 20000 100000
+```
+
+以上两个脚本默认开启 `curl_cffi` TLS 指纹伪装；两个脚本固定位置参数之后的额外参数会原样转发给底层 Python 命令，如需关闭指纹伪装：
+
+```bash
+bash scripts/run_async_crawl_10x.sh cc_seed_sites_100x_en.tsv data/runs/cc_async_10x 20000 100000 2048 512 --no-impersonate
+bash scripts/run_multiproc_10x.sh cc_seed_sites_100x_en.tsv data/runs/cc_multiproc_10x 8 20000 100000 --no-impersonate
 ```
 
 50 万页 turbo 抓取模板：
@@ -212,20 +286,6 @@ python3 src/optimized_live_crawler.py \
   --max-pages 100 \
   --save-html
 ```
-
-## 开发与测试
-
-安装开发依赖并运行 lint + 单元测试：
-
-```bash
-python3 -m pip install --index-url https://pypi.org/simple -e ".[dev]"
-ruff check .
-pytest -q
-```
-
-测试覆盖核心纯函数逻辑：URL 规范化/去重、scope 判断、sitemap/feed XML 解析、
-正文抽取、charset 解码、WARC header 解析、Common Crawl 站点筛选等（无需联网）。
-CI 会在 push/PR 时对 Python 3.10/3.11/3.12 自动跑 lint 和测试。
 
 ## 当前样例结果
 

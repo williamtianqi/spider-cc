@@ -37,4 +37,5 @@ python3 src/async_pipeline_crawler.py \
   --max-page-bytes 2000000 \
   --stats-jsonl cc_async_run_stats.jsonl \
   --partial-jsonl cc_async_pages_partial.jsonl \
-  --latest-json cc_async_run_latest.json
+  --latest-json cc_async_run_latest.json \
+  "${@:7}"

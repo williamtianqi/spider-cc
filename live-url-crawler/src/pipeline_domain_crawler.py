@@ -2,6 +2,7 @@
 import argparse
 import html as html_module
 import json
+import os
 import re
 import threading
 import time
@@ -23,6 +24,18 @@ def flush_handles(*handles):
             handle.flush()
 
 
+CHALLENGE_MARKERS = (
+    "checking your browser",
+    "just a moment",
+    "cf-browser-verification",
+    "cf-chl-",
+    "verify you are human",
+    "enable javascript and cookies",
+    "attention required! | cloudflare",
+    "captcha",
+    "access denied",
+)
+BLOCKING_ERROR_REASONS = {"http_403", "http_429", "http_503", "challenge_page"}
 HREF_RE = re.compile(r'''(?i)\bhref\s*=\s*["']([^"'#\s>]+)["']''')
 TITLE_RE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
 SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style|noscript|svg|canvas|template)[^>]*>.*?</\1>")
@@ -128,10 +141,41 @@ def write_extracted_record(record, extracted, content_hashes, counters, pages_ha
     write_jsonl_row(manifest_handle, record)
 
 
-def fetch_worker(item, timeout, max_page_bytes, host_semaphores, host_lock, max_host_workers, extract_mode, link_mode, write_full_text):
-    semaphore = base.get_host_semaphore(item["url"], host_semaphores, host_lock, max_host_workers)
-    if semaphore:
-        semaphore.acquire()
+def fetch_sitemap_worker(item, timeout, max_sitemap_bytes):
+    record = {
+        "url": item["url"],
+        "url_hash": item["url_hash"],
+        "source": item["source"],
+        "depth": item["depth"],
+        "from_url": item["from_url"],
+        "ok": False,
+    }
+    try:
+        status, final_url, headers, data = base.fetch_bytes(item["url"], timeout, max_sitemap_bytes)
+        if data[:2] == b"\x1f\x8b":
+            data = base.gzip.decompress(data)
+        record.update({"status": status, "final_url": final_url, "bytes": len(data)})
+        if status != 200 or not base.looks_like_xml(data, headers):
+            record["error"] = "sitemap_not_xml"
+            return {"record": record, "extract_input": None, "outlinks": []}
+        child_sitemaps, pages = base.parse_sitemap_xml(data)
+        outlinks = []
+        for child in child_sitemaps:
+            child_url = base.normalize_url(child["url"], final_url, allow_static=True)
+            if child_url:
+                outlinks.append({"url": child_url, "source": "sitemap_link", "from_url": final_url, "depth": item["depth"] + 1})
+        for page in pages:
+            page_url = base.normalize_url(page["url"], final_url)
+            if page_url:
+                outlinks.append({"url": page_url, "source": "sitemap_link_page", "from_url": final_url, "depth": item["depth"] + 1})
+        record.update({"ok": True, "sitemap_child_count": len(child_sitemaps), "sitemap_page_count": len(pages)})
+        return {"record": record, "extract_input": None, "outlinks": outlinks}
+    except Exception as exc:
+        record["error"] = repr(exc)
+        return {"record": record, "extract_input": None, "outlinks": []}
+
+
+def fetch_feed_worker(item, timeout, max_page_bytes):
     record = {
         "url": item["url"],
         "url_hash": item["url_hash"],
@@ -142,28 +186,89 @@ def fetch_worker(item, timeout, max_page_bytes, host_semaphores, host_lock, max_
     }
     try:
         status, final_url, headers, data = base.fetch_bytes(item["url"], timeout, max_page_bytes)
-        content_type = base.header_get(headers, "Content-Type")
-        record.update({"status": status, "final_url": final_url, "content_type": content_type, "bytes": len(data)})
-        if status != 200 or "html" not in content_type.lower():
-            record["error"] = "non_html_or_non_200"
+        if data[:2] == b"\x1f\x8b":
+            data = base.gzip.decompress(data)
+        record.update({"status": status, "final_url": final_url, "bytes": len(data)})
+        if status != 200 or not base.looks_like_xml(data, headers):
+            record["error"] = "feed_not_xml"
             return {"record": record, "extract_input": None, "outlinks": []}
-        html = decode_html_bytes(data, headers)
-        page_links = regex_extract_page_links(html, final_url) if link_mode == "regex" else base.extract_page_links(html, final_url)
-        record["canonical"] = page_links["canonical"]
-        outlinks = [{"url": link, "source": "page_link", "from_url": final_url, "depth": item["depth"] + 1} for link in page_links["links"]]
-        outlinks.extend({"url": feed, "source": "feed", "from_url": final_url, "depth": item["depth"] + 1} for feed in page_links["feeds"])
-        outlinks.extend({"url": sitemap, "source": "sitemap_link", "from_url": final_url, "depth": item["depth"] + 1} for sitemap in page_links["sitemaps"])
-        if extract_mode in {"fast-inline", "regex-inline"}:
-            if extract_mode == "regex-inline":
-                title, text, extractor = regex_extract_content(html, final_url)
-            else:
-                title, text, extractor = fast_extract_content(html, final_url)
-            extracted = build_extracted(item, final_url, title, text, extractor, write_full_text)
-            return {"record": record, "extracted": extracted, "extract_input": None, "outlinks": outlinks}
-        return {"record": record, "extracted": None, "extract_input": {"html": html, "url": final_url, "item": item}, "outlinks": outlinks}
+        urls = base.parse_feed_xml(data, final_url)
+        outlinks = [{"url": url, "source": "feed_item", "from_url": final_url, "depth": item["depth"] + 1} for url in urls]
+        record.update({"ok": True, "feed_item_count": len(urls)})
+        return {"record": record, "extract_input": None, "outlinks": outlinks}
     except Exception as exc:
         record["error"] = repr(exc)
         return {"record": record, "extract_input": None, "outlinks": []}
+
+
+def fetch_worker(item, timeout, max_page_bytes, max_sitemap_bytes, host_semaphores, host_lock, max_host_workers, extract_mode, link_mode, write_full_text, http_cache=None):
+    semaphore = base.get_host_semaphore(item["url"], host_semaphores, host_lock, max_host_workers)
+    if semaphore:
+        semaphore.acquire()
+    try:
+        if item["source"] == "sitemap_link":
+            return fetch_sitemap_worker(item, timeout, max_sitemap_bytes)
+        if item["source"] == "feed":
+            return fetch_feed_worker(item, timeout, max_page_bytes)
+        record = {
+            "url": item["url"],
+            "url_hash": item["url_hash"],
+            "source": item["source"],
+            "depth": item["depth"],
+            "from_url": item["from_url"],
+            "ok": False,
+        }
+        try:
+            extra_headers = None
+            cached = http_cache.get(item["url_hash"]) if http_cache else None
+            if cached:
+                extra_headers = {}
+                if cached.get("etag"):
+                    extra_headers["If-None-Match"] = cached["etag"]
+                if cached.get("last_modified"):
+                    extra_headers["If-Modified-Since"] = cached["last_modified"]
+            try:
+                status, final_url, headers, data = base.fetch_bytes(item["url"], timeout, max_page_bytes, extra_headers=extra_headers)
+            except base.HTTPError as exc:
+                if exc.code == 304:
+                    record.update({"status": 304, "ok": True, "not_modified": True})
+                    return {"record": record, "extract_input": None, "outlinks": [], "not_modified": True}
+                record.update({"status": exc.code, "error": f"http_{exc.code}"})
+                return {"record": record, "extract_input": None, "outlinks": []}
+            content_type = base.header_get(headers, "Content-Type")
+            record.update({"status": status, "final_url": final_url, "content_type": content_type, "bytes": len(data)})
+            cache_entry = None
+            if status == 200:
+                etag = base.header_get(headers, "ETag")
+                last_modified = base.header_get(headers, "Last-Modified")
+                if etag or last_modified:
+                    cache_entry = {"url_hash": item["url_hash"], "url": item["url"], "etag": etag, "last_modified": last_modified}
+            if status != 200:
+                record["error"] = f"http_{status}"
+                return {"record": record, "extract_input": None, "outlinks": []}
+            if "html" not in content_type.lower():
+                record["error"] = "non_html"
+                return {"record": record, "extract_input": None, "outlinks": []}
+            if any(marker in data[:4096].decode("utf-8", errors="ignore").lower() for marker in CHALLENGE_MARKERS):
+                record["error"] = "challenge_page"
+                return {"record": record, "extract_input": None, "outlinks": [], "cache_entry": cache_entry}
+            html = decode_html_bytes(data, headers)
+            page_links = regex_extract_page_links(html, final_url) if link_mode == "regex" else base.extract_page_links(html, final_url)
+            record["canonical"] = page_links["canonical"]
+            outlinks = [{"url": link, "source": "page_link", "from_url": final_url, "depth": item["depth"] + 1} for link in page_links["links"]]
+            outlinks.extend({"url": feed, "source": "feed", "from_url": final_url, "depth": item["depth"] + 1} for feed in page_links["feeds"])
+            outlinks.extend({"url": sitemap, "source": "sitemap_link", "from_url": final_url, "depth": item["depth"] + 1} for sitemap in page_links["sitemaps"])
+            if extract_mode in {"fast-inline", "regex-inline"}:
+                if extract_mode == "regex-inline":
+                    title, text, extractor = regex_extract_content(html, final_url)
+                else:
+                    title, text, extractor = fast_extract_content(html, final_url)
+                extracted = build_extracted(item, final_url, title, text, extractor, write_full_text)
+                return {"record": record, "extracted": extracted, "extract_input": None, "outlinks": outlinks, "cache_entry": cache_entry}
+            return {"record": record, "extracted": None, "extract_input": {"html": html, "url": final_url, "item": item}, "outlinks": outlinks, "cache_entry": cache_entry}
+        except Exception as exc:
+            record["error"] = repr(exc)
+            return {"record": record, "extract_input": None, "outlinks": []}
     finally:
         if semaphore:
             semaphore.release()
@@ -218,6 +323,157 @@ def write_progress(output_dir, snapshot):
     (output_dir / "progress.json").write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def is_resumable_run(output_dir):
+    return (output_dir / "manifest.jsonl").exists() and not (output_dir / "summary.json").exists()
+
+
+def is_locked_by_live_process(output_dir):
+    lock_path = output_dir / "pid.lock"
+    if not lock_path.exists():
+        return False
+    try:
+        pid = int(lock_path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def count_jsonl_lines(path):
+    path = Path(path)
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as f:
+        return sum(1 for _ in f)
+
+
+def load_hash_set(path, field):
+    values = set()
+    path = Path(path)
+    if not path.exists():
+        return values
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            value = row.get(field)
+            if value:
+                values.add(value)
+    return values
+
+
+def load_manifest_stats(path):
+    fetched = 0
+    ok = 0
+    duplicate_content = 0
+    not_modified = 0
+    error_reasons = Counter()
+    path = Path(path)
+    if not path.exists():
+        return {"fetched": 0, "ok": 0, "duplicate_content": 0, "not_modified": 0, "error_reasons": error_reasons}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            fetched += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("ok"):
+                ok += 1
+            if row.get("content_duplicate"):
+                duplicate_content += 1
+            if row.get("not_modified"):
+                not_modified += 1
+            if row.get("error"):
+                error_reasons[row["error"]] += 1
+    return {"fetched": fetched, "ok": ok, "duplicate_content": duplicate_content, "not_modified": not_modified, "error_reasons": error_reasons}
+
+
+def load_http_cache(path):
+    """Load url_hash -> {etag, last_modified} from a JSONL cache written by
+    previous runs. Later lines win so the freshest validators are used."""
+    cache = {}
+    if not path:
+        return cache
+    p = Path(path)
+    if not p.exists():
+        return cache
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            url_hash = row.get("url_hash")
+            if url_hash:
+                cache[url_hash] = {"etag": row.get("etag", ""), "last_modified": row.get("last_modified", "")}
+    return cache
+
+
+def load_seed_urls(path):
+    """Read extra frontier seed URLs (e.g. exported from the Common Crawl
+    index by cc_index_url_seeder.py). Accepts JSONL rows with a \"url\" field
+    or plain one-URL-per-line text; lines starting with # are ignored."""
+    urls = []
+    with Path(path).open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("{"):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                url = row.get("url", "")
+            else:
+                url = line
+            if url:
+                urls.append(url)
+    return urls
+
+
+def load_frontier_checkpoint(path):
+    queue = deque()
+    path = Path(path)
+    if not path.exists():
+        return queue
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            queue.append(row)
+    return queue
+
+
+def write_frontier_checkpoint(output_dir, queue):
+    tmp_path = output_dir / "frontier_checkpoint.jsonl.tmp"
+    final_path = output_dir / "frontier_checkpoint.jsonl"
+    with tmp_path.open("w", encoding="utf-8") as f:
+        for row in queue:
+            write_jsonl_row(f, row)
+    os.replace(tmp_path, final_path)
+
+
 def enqueue(queue, seen, discovered_handle, counters, url, source, depth, from_url, allowed_hosts, allowed_domains, include_subdomains, robots_cache, timeout, max_page_bytes, max_discovered, check_robots):
     if counters["discovered"] >= max_discovered:
         counters["reject_counts"]["max_discovered_reached"] += 1
@@ -269,6 +525,9 @@ def parse_args():
     parser.add_argument("--max-page-bytes", type=int, default=2000000)
     parser.add_argument("--max-sitemap-bytes", type=int, default=50000000)
     parser.add_argument("--write-full-text", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="Resume from an existing incomplete run in --output-dir using the periodic frontier checkpoint, discovered_urls.jsonl and pages.jsonl instead of restarting from the seed URL.")
+    parser.add_argument("--seed-urls-file", help="Extra frontier seed URLs (JSONL with a url field, or plain text one URL per line), e.g. the per-domain URL list exported from the Common Crawl index by cc_index_url_seeder.py. Loaded once on fresh starts; ignored on --resume because those URLs are already in discovered_urls.jsonl.")
+    parser.add_argument("--http-cache-file", help="JSONL file persisting ETag/Last-Modified validators per url_hash across runs. When provided, revisited URLs are fetched conditionally and HTTP 304 responses are counted as not_modified instead of re-downloading unchanged bodies.")
     return parser.parse_args()
 
 
@@ -283,42 +542,85 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    resume = args.resume and is_resumable_run(output_dir)
+    if args.resume and is_locked_by_live_process(output_dir):
+        raise RuntimeError(f"output_dir {output_dir} is locked by a live process (pid.lock); refusing to resume concurrently")
+
     log_path = output_dir / "crawl.log"
-    log_path.write_text("", encoding="utf-8")
+    if not resume:
+        log_path.write_text("", encoding="utf-8")
     started = time.time()
     robots_cache = {}
-    queue = deque()
-    seen = set()
-    content_hashes = set()
     host_semaphores = {}
     host_lock = threading.Lock()
-    counters = {
-        "discovered": 0,
-        "scheduled": 0,
-        "fetched": 0,
-        "ok": 0,
-        "unique_text": 0,
-        "duplicate_content": 0,
-        "links": 0,
-        "reject_counts": Counter(),
-    }
 
-    discovered_f = (output_dir / "discovered_urls.jsonl").open("w", encoding="utf-8")
-    links_f = None if args.no_write_links else (output_dir / "links.jsonl").open("w", encoding="utf-8")
-    manifest_f = (output_dir / "manifest.jsonl").open("w", encoding="utf-8")
-    pages_f = (output_dir / "pages.jsonl").open("w", encoding="utf-8")
-    sitemap_f = (output_dir / "sitemap_reports.jsonl").open("w", encoding="utf-8")
+    if resume:
+        seen = load_hash_set(output_dir / "discovered_urls.jsonl", "url_hash")
+        content_hashes = load_hash_set(output_dir / "pages.jsonl", "content_hash")
+        queue = load_frontier_checkpoint(output_dir / "frontier_checkpoint.jsonl")
+        manifest_stats = load_manifest_stats(output_dir / "manifest.jsonl")
+        counters = {
+            "discovered": len(seen),
+            "scheduled": manifest_stats["fetched"],
+            "fetched": manifest_stats["fetched"],
+            "ok": manifest_stats["ok"],
+            "unique_text": len(content_hashes),
+            "duplicate_content": manifest_stats["duplicate_content"],
+            "not_modified": manifest_stats["not_modified"],
+            "links": count_jsonl_lines(output_dir / "links.jsonl") if not args.no_write_links else 0,
+            "reject_counts": Counter(),
+            "error_reasons": manifest_stats["error_reasons"],
+        }
+    else:
+        queue = deque()
+        seen = set()
+        content_hashes = set()
+        counters = {
+            "discovered": 0,
+            "scheduled": 0,
+            "fetched": 0,
+            "ok": 0,
+            "unique_text": 0,
+            "duplicate_content": 0,
+            "not_modified": 0,
+            "links": 0,
+            "reject_counts": Counter(),
+            "error_reasons": Counter(),
+        }
 
+    http_cache = load_http_cache(args.http_cache_file)
+    http_cache_f = Path(args.http_cache_file).open("a", encoding="utf-8") if args.http_cache_file else None
+
+    file_mode = "a" if resume else "w"
+    discovered_f = (output_dir / "discovered_urls.jsonl").open(file_mode, encoding="utf-8")
+    links_f = None if args.no_write_links else (output_dir / "links.jsonl").open(file_mode, encoding="utf-8")
+    manifest_f = (output_dir / "manifest.jsonl").open(file_mode, encoding="utf-8")
+    pages_f = (output_dir / "pages.jsonl").open(file_mode, encoding="utf-8")
+    sitemap_f = (output_dir / "sitemap_reports.jsonl").open(file_mode, encoding="utf-8")
+
+    pid_lock_path = output_dir / "pid.lock"
+    pid_lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    sitemap_pages, sitemap_reports = [], []
     try:
         check_robots_on_enqueue = args.robots_check_stage == "enqueue"
-        log_line(log_path, f"start seed={seed_url} max_pages={args.max_pages} fetch_workers={args.fetch_workers} extract_workers={args.extract_workers} max_host_workers={args.max_host_workers} extract_mode={args.extract_mode} link_mode={args.link_mode} robots_check_stage={args.robots_check_stage} write_links={not args.no_write_links}")
-        sitemap_pages, sitemap_reports = base.discover_sitemaps(seed_url, allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_sitemap_bytes, args.max_sitemaps)
-        for report in sitemap_reports:
-            write_jsonl_row(sitemap_f, report)
-        log_line(log_path, f"sitemap_discovery pages={len(sitemap_pages)} reports={len(sitemap_reports)}")
-        enqueue(queue, seen, discovered_f, counters, seed_url, "seed", 0, "", allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_discovered, check_robots_on_enqueue)
-        for page in sitemap_pages:
-            enqueue(queue, seen, discovered_f, counters, page["url"], "sitemap", 0, "", allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_discovered, check_robots_on_enqueue)
+        if resume:
+            log_line(log_path, f"resume seed={seed_url} loaded_seen={len(seen)} loaded_content_hashes={len(content_hashes)} loaded_frontier={len(queue)} prior_fetched={counters['fetched']} prior_ok={counters['ok']}")
+        else:
+            log_line(log_path, f"start seed={seed_url} max_pages={args.max_pages} fetch_workers={args.fetch_workers} extract_workers={args.extract_workers} max_host_workers={args.max_host_workers} extract_mode={args.extract_mode} link_mode={args.link_mode} robots_check_stage={args.robots_check_stage} write_links={not args.no_write_links}")
+            sitemap_pages, sitemap_reports = base.discover_sitemaps(seed_url, allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_sitemap_bytes, args.max_sitemaps)
+            for report in sitemap_reports:
+                write_jsonl_row(sitemap_f, report)
+            log_line(log_path, f"sitemap_discovery pages={len(sitemap_pages)} reports={len(sitemap_reports)}")
+            enqueue(queue, seen, discovered_f, counters, seed_url, "seed", 0, "", allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_discovered, check_robots_on_enqueue)
+            for page in sitemap_pages:
+                enqueue(queue, seen, discovered_f, counters, page["url"], "sitemap", 0, "", allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_discovered, check_robots_on_enqueue)
+            if args.seed_urls_file:
+                seed_urls = load_seed_urls(args.seed_urls_file)
+                for url in seed_urls:
+                    enqueue(queue, seen, discovered_f, counters, url, "cc_index_seed", 0, "", allowed_hosts, allowed_domains, args.include_subdomains, robots_cache, args.timeout, args.max_page_bytes, args.max_discovered, check_robots_on_enqueue)
+                log_line(log_path, f"seed_urls_file loaded path={args.seed_urls_file} urls={len(seed_urls)} frontier={len(queue)}")
 
         fetch_futures = {}
         extract_futures = {}
@@ -333,7 +635,7 @@ def main():
                     if args.robots_check_stage == "fetch" and not base.can_fetch(item["url"], robots_cache, args.timeout, args.max_page_bytes):
                         counters["reject_counts"]["robots_disallow"] += 1
                         continue
-                    future = fetch_pool.submit(fetch_worker, item, args.timeout, args.max_page_bytes, host_semaphores, host_lock, args.max_host_workers, args.extract_mode, args.link_mode, args.write_full_text)
+                    future = fetch_pool.submit(fetch_worker, item, args.timeout, args.max_page_bytes, args.max_sitemap_bytes, host_semaphores, host_lock, args.max_host_workers, args.extract_mode, args.link_mode, args.write_full_text, http_cache)
                     fetch_futures[future] = item
                     counters["scheduled"] += 1
                 if not fetch_futures and not extract_futures:
@@ -348,8 +650,14 @@ def main():
                         result = future.result()
                         record = result["record"]
                         counters["fetched"] += 1
-                        if result.get("extracted") or result.get("extract_input"):
+                        if record.get("error"):
+                            counters["error_reasons"][record["error"]] += 1
+                        if result.get("extracted") or result.get("extract_input") or result.get("not_modified"):
                             counters["ok"] += 1
+                        if result.get("not_modified"):
+                            counters["not_modified"] += 1
+                        if result.get("cache_entry") and http_cache_f is not None:
+                            write_jsonl_row(http_cache_f, result["cache_entry"])
                         if result.get("extracted"):
                             write_extracted_record(record, result["extracted"], content_hashes, counters, pages_f, manifest_f)
                         elif not result.get("extract_input"):
@@ -374,7 +682,8 @@ def main():
                         extracted = future.result()
                         write_extracted_record(record, extracted, content_hashes, counters, pages_f, manifest_f)
                 if counters["fetched"] >= next_progress_at:
-                    flush_handles(discovered_f, links_f, manifest_f, pages_f, sitemap_f)
+                    flush_handles(discovered_f, links_f, manifest_f, pages_f, sitemap_f, http_cache_f)
+                    write_frontier_checkpoint(output_dir, queue)
                     snapshot = progress_snapshot(args, started, counters["scheduled"], counters["fetched"], counters["ok"], counters["unique_text"], counters["duplicate_content"], queue, counters["discovered"], counters["links"], counters["reject_counts"], len(fetch_futures), len(extract_futures))
                     write_progress(output_dir, snapshot)
                     log_line(log_path, f"progress fetched={snapshot['fetched_pages']} rate={snapshot['fetch_pages_per_second']}/s scheduled={snapshot['scheduled_pages']} discovered={snapshot['discovered_urls']} frontier={snapshot['remaining_frontier']} in_fetch={snapshot['in_flight_fetch']} in_extract={snapshot['in_flight_extract']} unique_text={snapshot['unique_extracted_text_records']}")
@@ -394,12 +703,15 @@ def main():
         elif len(queue) > 0 and counters["discovered"] >= args.max_discovered:
             stopped_reason = "max_discovered_reached"
         site_crawl_complete = len(queue) == 0 and stopped_reason == "frontier_exhausted"
+        blocking_errors = sum(v for k, v in counters["error_reasons"].items() if k in BLOCKING_ERROR_REASONS)
+        likely_blocked = counters["unique_text"] == 0 and counters["fetched"] > 0 and blocking_errors >= max(1, counters["fetched"] * 0.5)
         summary = {
             "seed_url": seed_url,
             "allowed_hosts": sorted(allowed_hosts),
             "allowed_domains": sorted(allowed_domains),
             "include_subdomains": args.include_subdomains,
             "mode": "pipeline_master_fetcher_extractor",
+            "resumed_from_checkpoint": resume,
             "extract_mode": args.extract_mode,
             "link_mode": args.link_mode,
             "robots_check_stage": args.robots_check_stage,
@@ -412,9 +724,14 @@ def main():
             "ok_manifest_records": counters["ok"],
             "unique_text_pages": counters["unique_text"],
             "duplicate_content_pages": counters["duplicate_content"],
+            "not_modified_pages": counters["not_modified"],
+            "seed_urls_file": args.seed_urls_file or "",
+            "http_cache_file": args.http_cache_file or "",
             "remaining_frontier": len(queue),
             "site_crawl_complete": site_crawl_complete,
             "stopped_reason": stopped_reason,
+            "likely_blocked": likely_blocked,
+            "error_reasons": dict(counters["error_reasons"].most_common(10)),
             "link_edges": counters["links"],
             "reject_counts": dict(counters["reject_counts"]),
             "elapsed_seconds": round(time.time() - started, 2),
@@ -430,11 +747,16 @@ def main():
             },
         }
         (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        checkpoint_path = output_dir / "frontier_checkpoint.jsonl"
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     finally:
-        for handle in [discovered_f, links_f, manifest_f, pages_f, sitemap_f]:
+        for handle in [discovered_f, links_f, manifest_f, pages_f, sitemap_f, http_cache_f]:
             if handle is not None:
                 handle.close()
+        if pid_lock_path.exists():
+            pid_lock_path.unlink()
 
 
 if __name__ == "__main__":

@@ -97,6 +97,14 @@ def main():
     parser.add_argument("--stats-jsonl", default="cc_multiproc_stats.jsonl")
     parser.add_argument("--partial-jsonl", default="cc_multiproc_partial.jsonl")
     parser.add_argument("--latest-json", default="cc_multiproc_latest.json")
+    parser.add_argument(
+        "--impersonate", dest="impersonate", action="store_true", default=True,
+        help="用 curl_cffi 模拟真实浏览器 TLS/JA3/HTTP2 指纹 (默认开启)",
+    )
+    parser.add_argument(
+        "--no-impersonate", dest="impersonate", action="store_false",
+        help="强制退回 aiohttp 裸连接, 不做 TLS 指纹伪装",
+    )
     args = parser.parse_args()
 
     seeds = load_all_seeds(args.seeds_tsv, args.max_sites)
@@ -121,6 +129,7 @@ def main():
         "stats_jsonl": args.stats_jsonl,
         "partial_jsonl": args.partial_jsonl,
         "latest_json": args.latest_json,
+        "impersonate": args.impersonate,
     }
 
     started = time.time()
