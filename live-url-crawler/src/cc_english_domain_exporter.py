@@ -54,6 +54,12 @@ def parse_args():
     )
     parser.add_argument("--http-threads", type=int, default=8)
     parser.add_argument("--max-retries", type=int, default=8)
+    parser.add_argument(
+        "--sleep-between-files",
+        type=float,
+        default=0.0,
+        help="Politeness delay in seconds between index files to avoid rate limiting",
+    )
     return parser.parse_args()
 
 
@@ -78,10 +84,14 @@ def scan_file(con, url, language_filter, max_retries):
     for attempt in range(1, max_retries + 1):
         try:
             return con.execute(query, {"url": url}).fetchall()
-        except (duckdb.HTTPException, duckdb.IOException) as error:
+        except duckdb.Error as error:
             if attempt == max_retries:
                 raise
-            delay = min(120, 2**attempt)
+            message = str(error)
+            if "403" in message:
+                delay = 900
+            else:
+                delay = min(120, 2**attempt)
             emit_progress(
                 {
                     "stage": "retry",
@@ -133,6 +143,8 @@ def main():
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute(f"SET threads={max(1, args.http_threads)};")
+    con.execute("SET http_timeout=60000;")
+    con.execute("SET http_retries=2;")
     language_filter = (
         "content_languages = 'eng'"
         if args.english_only_strict
@@ -151,6 +163,8 @@ def main():
                 handle.write(f"{domain}\t{pages}\n")
         with done_path.open("a", encoding="utf-8") as handle:
             handle.write(name + "\n")
+        if args.sleep_between_files > 0:
+            time.sleep(args.sleep_between_files)
         emit_progress(
             {
                 "stage": "file_done",
