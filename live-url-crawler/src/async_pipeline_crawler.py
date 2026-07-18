@@ -30,7 +30,28 @@ try:
 except ImportError:
     raise SystemExit("需要 aiohttp: pip install aiohttp")
 
+import browser_fingerprint as fp
+
+try:
+    from curl_cffi.requests import AsyncSession as CffiAsyncSession
+    from curl_cffi.requests import RequestsError as CffiRequestsError
+except ImportError:
+    CffiAsyncSession = None
+    CffiRequestsError = Exception
+
 USER_AGENT = "live-url-crawler/2.0 (async)"
+BLOCKING_ERROR_REASONS = {"403", "429", "503", "challenge_page"}
+CHALLENGE_MARKERS = (
+    "checking your browser",
+    "just a moment",
+    "cf-browser-verification",
+    "cf-chl-",
+    "verify you are human",
+    "enable javascript and cookies",
+    "attention required! | cloudflare",
+    "captcha",
+    "access denied",
+)
 STATIC_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
     ".css", ".js", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz",
@@ -185,6 +206,7 @@ class SiteCrawler:
         self.pages_handle = (self.output_dir / "pages.jsonl").open("w", encoding="utf-8")
         self.finished = False
         self.stopped_reason = ""
+        self.error_reasons = Counter()
 
         normalized = normalize_url(seed_url)
         if normalized:
@@ -240,9 +262,10 @@ class SiteCrawler:
         }
         self.pages_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def record_fail(self):
+    def record_fail(self, reason="unknown"):
         self.fetched += 1
         self.in_flight -= 1
+        self.error_reasons[reason] += 1
 
     def is_done(self):
         if self.stopped_reason and self.in_flight <= 0:
@@ -259,6 +282,8 @@ class SiteCrawler:
         self.pages_handle.close()
         elapsed = time.time() - self.started
         site_crawl_complete = len(self.queue) == 0 and self.stopped_reason == "frontier_exhausted"
+        blocking_errors = sum(v for k, v in self.error_reasons.items() if k in BLOCKING_ERROR_REASONS)
+        likely_blocked = self.unique_text == 0 and self.fetched > 0 and blocking_errors >= max(1, self.fetched * 0.5)
         summary = {
             "seed_url": self.seed_url,
             "scope_domain": self.scope_domain,
@@ -271,6 +296,8 @@ class SiteCrawler:
             "unique_text_pages": self.unique_text,
             "remaining_frontier": len(self.queue),
             "elapsed_seconds": round(elapsed, 2),
+            "likely_blocked": likely_blocked,
+            "error_reasons": dict(self.error_reasons.most_common(5)),
         }
         (self.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return summary
@@ -284,6 +311,7 @@ class AsyncCrawlEngine:
         self.max_concurrent = args.max_concurrent
         self.max_per_host = args.max_per_host
         self.timeout = aiohttp.ClientTimeout(total=args.timeout, connect=5)
+        self.use_cffi = bool(CffiAsyncSession is not None and getattr(args, "impersonate", True))
         self.host_semaphores = {}
         self.global_semaphore = asyncio.Semaphore(self.max_concurrent)
         self.sites = []
@@ -330,35 +358,75 @@ class AsyncCrawlEngine:
         print(f"Loaded {count} sites to crawl", flush=True)
 
     async def fetch_one(self, session, site, item):
+        if self.use_cffi:
+            return await self._fetch_one_cffi(session, site, item)
+        return await self._fetch_one_aiohttp(session, site, item)
+
+    async def _fetch_one_aiohttp(self, session, site, item):
         url = item["url"]
         depth = item["depth"]
+        host = host_of(url)
         host_sem = self.get_host_semaphore(url)
+        req_headers = {"User-Agent": fp.user_agent_for_host(host), "Accept": "text/html,*/*;q=0.8"}
         data = None
         content_type = ""
         final_url = url
-        async with self.global_semaphore:
-            async with host_sem:
-                try:
-                    async with session.get(url, allow_redirects=True, max_redirects=5) as resp:
-                        if resp.status != 200:
-                            site.record_fail()
-                            self.total_fetched += 1
-                            return
-                        content_type = resp.headers.get("Content-Type", "")
-                        if "html" not in content_type.lower():
-                            site.record_fail()
-                            self.total_fetched += 1
-                            return
-                        data = await resp.read()
-                        final_url = str(resp.url)
-                        if len(data) > self.args.max_page_bytes:
-                            site.record_fail()
-                            self.total_fetched += 1
-                            return
-                except Exception:
-                    site.record_fail()
-                    self.total_fetched += 1
-                    return
+        max_attempts = 3
+        last_reason = "unknown"
+        for attempt in range(max_attempts):
+            async with self.global_semaphore:
+                async with host_sem:
+                    try:
+                        async with session.get(url, headers=req_headers, allow_redirects=True, max_redirects=5) as resp:
+                            if resp.status == 429 or resp.status >= 500:
+                                last_reason = str(resp.status)
+                                if attempt < max_attempts - 1:
+                                    retry_after = resp.headers.get("Retry-After")
+                                    wait_s = (attempt + 1) * 1.5
+                                    if retry_after:
+                                        try:
+                                            wait_s = min(float(retry_after), 30.0)
+                                        except ValueError:
+                                            pass
+                                    await asyncio.sleep(wait_s)
+                                    continue
+                                site.record_fail(last_reason)
+                                self.total_fetched += 1
+                                return
+                            if resp.status != 200:
+                                site.record_fail(str(resp.status))
+                                self.total_fetched += 1
+                                return
+                            content_type = resp.headers.get("Content-Type", "")
+                            if "html" not in content_type.lower():
+                                site.record_fail("non_html")
+                                self.total_fetched += 1
+                                return
+                            data = await resp.read()
+                            final_url = str(resp.url)
+                            if len(data) > self.args.max_page_bytes:
+                                site.record_fail("too_large")
+                                self.total_fetched += 1
+                                return
+                            break
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                        last_reason = type(exc).__name__
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep((attempt + 1) * 1.5)
+                            continue
+                        site.record_fail(last_reason)
+                        self.total_fetched += 1
+                        return
+                    except Exception as exc:
+                        site.record_fail(repr(exc)[:40])
+                        self.total_fetched += 1
+                        return
+
+        lower_snippet = data[:4096].decode("utf-8", errors="ignore").lower()
+        if any(marker in lower_snippet for marker in CHALLENGE_MARKERS):
+            site.record_fail("challenge_page")
+            self.total_fetched += 1
+            return
 
         html = decode_html_bytes(data, content_type)
         title, text = extract_content(html)
@@ -366,7 +434,119 @@ class AsyncCrawlEngine:
             site.record_result(final_url, title, text, depth)
             self.total_unique += 1
         else:
-            site.record_fail()
+            site.record_fail("empty_content")
+            self.total_fetched += 1
+            return
+
+        links = extract_links(html, final_url, site.allowed_domains, True)
+        for link in links[:500]:
+            site.enqueue(link, depth + 1)
+        self.total_fetched += 1
+
+    async def _fetch_one_cffi(self, session, site, item):
+        """用 curl_cffi 做浏览器 TLS/JA3 指纹伪装的抓取路径。"""
+        url = item["url"]
+        depth = item["depth"]
+        host = host_of(url)
+        host_sem = self.get_host_semaphore(url)
+        profile = fp.profile_for_host(host)
+        data = None
+        content_type = ""
+        final_url = url
+        max_attempts = 3
+        last_reason = "unknown"
+        for attempt in range(max_attempts):
+            async with self.global_semaphore:
+                async with host_sem:
+                    resp = None
+                    try:
+                        resp = await session.get(
+                            url, impersonate=profile, allow_redirects=True, max_redirects=5,
+                            timeout=self.args.timeout, stream=True,
+                        )
+                        if resp.status_code == 429 or resp.status_code >= 500:
+                            last_reason = str(resp.status_code)
+                            if attempt < max_attempts - 1:
+                                retry_after = resp.headers.get("Retry-After")
+                                wait_s = (attempt + 1) * 1.5
+                                if retry_after:
+                                    try:
+                                        wait_s = min(float(retry_after), 30.0)
+                                    except ValueError:
+                                        pass
+                                await resp.aclose()
+                                await asyncio.sleep(wait_s)
+                                continue
+                            site.record_fail(last_reason)
+                            self.total_fetched += 1
+                            await resp.aclose()
+                            return
+                        if resp.status_code != 200:
+                            site.record_fail(str(resp.status_code))
+                            self.total_fetched += 1
+                            await resp.aclose()
+                            return
+                        content_type = resp.headers.get("Content-Type", "")
+                        if "html" not in content_type.lower():
+                            site.record_fail("non_html")
+                            self.total_fetched += 1
+                            await resp.aclose()
+                            return
+                        chunks = []
+                        total = 0
+                        too_large = False
+                        async for chunk in resp.aiter_content():
+                            total += len(chunk)
+                            if total > self.args.max_page_bytes:
+                                too_large = True
+                                break
+                            chunks.append(chunk)
+                        await resp.aclose()
+                        if too_large:
+                            site.record_fail("too_large")
+                            self.total_fetched += 1
+                            return
+                        data = b"".join(chunks)
+                        final_url = resp.url
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except (CffiRequestsError, asyncio.TimeoutError) as exc:
+                        if resp is not None:
+                            try:
+                                await resp.aclose()
+                            except Exception:
+                                pass
+                        last_reason = type(exc).__name__
+                        if attempt < max_attempts - 1:
+                            await asyncio.sleep((attempt + 1) * 1.5)
+                            continue
+                        site.record_fail(last_reason)
+                        self.total_fetched += 1
+                        return
+                    except Exception as exc:
+                        if resp is not None:
+                            try:
+                                await resp.aclose()
+                            except Exception:
+                                pass
+                        site.record_fail(repr(exc)[:40])
+                        self.total_fetched += 1
+                        return
+
+        lower_snippet = data[:4096].decode("utf-8", errors="ignore").lower()
+        if any(marker in lower_snippet for marker in CHALLENGE_MARKERS):
+            site.record_fail("challenge_page")
+            self.total_fetched += 1
+            return
+
+        html = decode_html_bytes(data, content_type)
+        title, text = extract_content(html)
+        if text and len(text) > 50:
+            site.record_result(final_url, title, text, depth)
+            self.total_unique += 1
+        else:
+            site.record_fail("empty_content")
             self.total_fetched += 1
             return
 
@@ -432,51 +612,60 @@ class AsyncCrawlEngine:
         self.latest_path.write_text(json.dumps(stat, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"[{stat['timestamp']}] fetched={self.total_fetched} unique={self.total_unique} rate={rate:.1f}/s active={len(self.active_sites)} queue={len(self.sites)} done={len(self.completed_sites)} inflight={stat['in_flight']}", flush=True)
 
-    async def run(self):
-        connector = aiohttp.TCPConnector(
-            limit=self.max_concurrent,
-            limit_per_host=self.max_per_host,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True,
-            force_close=False,
-        )
-        headers = {"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8"}
+    async def _run_loop(self, session):
+        self.refill_active(target=self.args.active_sites)
+        last_stats = time.time()
+        pending = set()
+        self._in_flight = 0
 
-        async with aiohttp.ClientSession(connector=connector, timeout=self.timeout, headers=headers) as session:
+        while self.active_sites or self.sites or pending:
             self.refill_active(target=self.args.active_sites)
-            last_stats = time.time()
-            pending = set()
-            self._in_flight = 0
 
-            while self.active_sites or self.sites or pending:
-                self.refill_active(target=self.args.active_sites)
-
-                # 持续向 pending 集合填充任务直到达到并发上限
-                fill_count = self.max_concurrent - len(pending)
-                if fill_count > 0 and self.active_sites:
-                    items = self.collect_items(fill_count)
-                    for site, item in items:
-                        task = asyncio.ensure_future(self.fetch_one(session, site, item))
-                        pending.add(task)
-                    self._in_flight = len(pending)
-
-                if not pending:
-                    break
-
-                # 等待至少一个完成
-                done, pending = await asyncio.wait(pending, timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    try:
-                        task.result()
-                    except Exception:
-                        pass
+            # 持续向 pending 集合填充任务直到达到并发上限
+            fill_count = self.max_concurrent - len(pending)
+            if fill_count > 0 and self.active_sites:
+                items = self.collect_items(fill_count)
+                for site, item in items:
+                    task = asyncio.ensure_future(self.fetch_one(session, site, item))
+                    pending.add(task)
                 self._in_flight = len(pending)
-                self.check_finalize_sites()
 
-                now = time.time()
-                if now - last_stats >= 10:
-                    self.write_stats()
-                    last_stats = now
+            if not pending:
+                break
+
+            # 等待至少一个完成
+            done, pending = await asyncio.wait(pending, timeout=1.0, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                try:
+                    task.result()
+                except Exception:
+                    pass
+            self._in_flight = len(pending)
+            self.check_finalize_sites()
+
+            now = time.time()
+            if now - last_stats >= 10:
+                self.write_stats()
+                last_stats = now
+
+    async def run(self):
+        if self.use_cffi:
+            print(f"HTTP backend: curl_cffi (TLS/JA3 浏览器指纹伪装, max_clients={self.max_concurrent})", flush=True)
+            async with CffiAsyncSession(max_clients=self.max_concurrent) as session:
+                await self._run_loop(session)
+        else:
+            reason = "curl_cffi 未安装" if CffiAsyncSession is None else "--no-impersonate"
+            print(f"HTTP backend: aiohttp (无 TLS 指纹伪装, {reason})", flush=True)
+            connector = aiohttp.TCPConnector(
+                limit=self.max_concurrent,
+                limit_per_host=self.max_per_host,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+                force_close=False,
+            )
+            headers = {"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8"}
+            async with aiohttp.ClientSession(connector=connector, timeout=self.timeout, headers=headers) as session:
+                await self._run_loop(session)
 
         self.write_stats()
         # 合并 partial JSONL
@@ -510,6 +699,11 @@ def parse_args():
     parser.add_argument("--stats-jsonl", default="cc_async_run_stats.jsonl")
     parser.add_argument("--partial-jsonl", default="cc_async_pages_partial.jsonl")
     parser.add_argument("--latest-json", default="cc_async_run_latest.json")
+    parser.add_argument(
+        "--impersonate", action=argparse.BooleanOptionalAction, default=True,
+        help="用 curl_cffi 模拟真实浏览器 TLS/JA3/HTTP2 指纹 (需要 pip install curl_cffi); "
+             "--no-impersonate 强制退回 aiohttp 裸连接",
+    )
     return parser.parse_args()
 
 
